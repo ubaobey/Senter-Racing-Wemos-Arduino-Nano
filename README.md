@@ -1,161 +1,145 @@
-# SENTER RACING
+# SENTER RACING — Skema Hardware
 
-Firmware lampu senter berbasis **Wemos D1 mini (ESP8266)** dengan pembaca
-tegangan baterai terpisah berbasis **Arduino Nano**. Wemos mengatur output LED,
-kipas, layar, tombol, serta perlindungan baterai dan suhu. Nano membaca tegangan
-baterai dan mengirimkannya ke Wemos melalui serial.
+Dokumen ini menjelaskan sambungan hardware untuk firmware Wemos D1 Mini dan
+Arduino Nano battery reader.
 
-## Isi repositori
+## Komponen
 
-```text
-SENTER_RACING/
-├── README.md
-├── SENTER_RACING_WEMOS/
-│   └── SENTER_RACING_WEMOS.ino
-└── NANO_BATTERY_READER/
-    └── NANO_BATTERY_READER.ino
-```
+- Wemos D1 Mini / ESP8266
+- Arduino Nano (logika 5 V)
+- Baterai LiPo 3S (maksimum 12,6 V)
+- OLED SSD1306 I2C, 128 × 64, alamat I2C `0x3C`
+- Sensor suhu DS18B20 dan resistor pull-up 4,7 kΩ
+- Tiga tombol tekan: MAIN, PLUS, dan MINUS
+- Beban LED dan kipas, masing-masing dengan driver yang sesuai
+- Pembagi tegangan baterai: 100 kΩ dan 10 kΩ
+- Pembagi level serial: 1 kΩ dan 1,8 kΩ
+- Regulator DC-DC 5 V yang sesuai untuk arus total rangkaian
 
-Kedua sketch adalah bagian dari sistem yang sama, tetapi harus diunggah ke
-board masing-masing.
-
-## Fitur
-
-- Lima mode lampu: **LOW**, **MEDIUM**, **HIGH**, **STROBO**, dan **TURBO**.
-- Pengaturan intensitas dan opsi sistem melalui tombol serta OLED.
-- Pengaturan disimpan di EEPROM Wemos.
-- Pemantauan tegangan baterai LiPo 3S, indikator persentase, dan pembatasan
-  output saat baterai lemah.
-- Pembacaan suhu DS18B20 dan pengaturan kipas.
-- Komunikasi serial Wemos–Nano memakai sequence number dan checksum XOR.
-- Peringatan OLED apabila Nano tidak terdeteksi.
-
-## Perangkat keras
-
-- Wemos D1 mini berbasis ESP8266.
-- Arduino Nano.
-- Baterai LiPo 3S.
-- OLED SSD1306 I2C 128×64.
-- Sensor suhu DS18B20.
-- Kipas dan rangkaian driver LED yang sesuai dengan arus/beban LED.
-- Tombol utama, tombol tambah, dan tombol kurang.
-- Resistor pembagi tegangan baterai dan resistor untuk penyesuaian level serial
-  seperti diagram berikut.
-
-### Pin Wemos
-
-| Pin Wemos | Sambungan |
-| --- | --- |
-| D1 | OLED SCL |
-| D2 | OLED SDA |
-| D3 | Tombol kurang |
-| D4 | DS18B20 |
-| D5 | PWM driver LED |
-| D6 | Tombol utama |
-| D7 | Tombol tambah |
-| D0 | PWM kipas |
-| RX | Terima data dari Nano D1/TX melalui pembagi level |
-| TX | Kirim data ke Nano D0/RX |
-
-### Nano dan komunikasi serial
-
-| Pin Nano | Sambungan |
-| --- | --- |
-| A0 | Titik tengah pembagi tegangan baterai |
-| D0/RX | Wemos TX |
-| D1/TX | Wemos RX melalui resistor 1 kΩ seri dan 1,8 kΩ ke GND |
-| GND | GND bersama dengan Wemos dan negatif baterai |
-
-Skema pembagi level pada jalur **Nano TX ke Wemos RX**:
+## Skema koneksi
 
 ```text
-Nano D1/TX --- 1 kΩ ---+--- Wemos RX
-                       |
-                      1,8 kΩ
-                       |
-                      GND
+BATTERY / POWER
+==============
+LiPo 3S BAT+ (9–12,6 V) --+----> Driver LED / kipas, sesuai rating beban*
+                           +----> IN+ regulator DC-DC 5 V
+                           +-- 100 kΩ --+----> Nano A0
+                                        |
+                                       10 kΩ
+                                        |
+LiPo 3S BAT- ---------------------------+---- GND BERSAMA
+                                              +-- Nano GND
+                                              +-- Wemos GND
+                                              +-- driver GND
+                                              +-- sensor / OLED GND
+
+Regulator OUT+ 5 V ---------------------------+-- Nano 5V
+                                              +-- Wemos 5V/VIN**
+OLED VCC ---------------- Wemos 3V3
+DS18B20 VDD ------------ Wemos 3V3
+
+WEMOS D1 MINI / ESP8266
+=======================
+D1 / GPIO5  ---------------- OLED SCL
+D2 / GPIO4  ---------------- OLED SDA
+D3 / GPIO0  ---------------- Tombol MINUS ---- GND
+D4 / GPIO2  ---------------- DS18B20 DATA
+                              |
+                             4,7 kΩ
+                              |
+                             3V3
+D5 / GPIO14 PWM ------------ Driver LED (input PWM)
+D6 / GPIO12 --------------- Tombol MAIN ------ GND
+D7 / GPIO13 --------------- Tombol PLUS ------ GND
+D0 / GPIO16 PWM ------------ Driver kipas (input PWM)
+D8 / GPIO15 ---------------- Tidak digunakan
+TX / GPIO1 ----------------- Nano D0 / RX
+RX / GPIO3 <----------------+---- 1 kΩ ---- Nano D1 / TX
+                            |
+                           1,8 kΩ
+                            |
+                           GND
 ```
 
-### Penting: nilai resistor pembagi baterai
+`*` Daya untuk LED dan kipas mengikuti spesifikasi bebannya dan driver yang
+digunakan. Jangan mengalirkan arus beban langsung melalui pin Wemos. Gunakan
+driver LED yang menerima PWM 3,3 V dan driver kipas yang sesuai dengan jenis
+kipasnya; satukan ground driver dengan ground Wemos. Untuk kipas DC dua-kawat
+yang dikendalikan dengan MOSFET, gunakan MOSFET logic-level dan proteksi
+induktif yang sesuai. Jangan gunakan rangkaian low-side tersebut untuk kipas
+empat-kawat yang memiliki masukan PWM khusus; ikuti spesifikasi kipasnya.
 
-Komentar wiring di kedua sketch menyebut **100 kΩ dan 15 kΩ**, tetapi kode
-`NANO_BATTERY_READER.ino` saat ini menghitung tegangan menggunakan
-`BATTERY_R1 = 100000` dan `BATTERY_R2 = 10000` (100 kΩ dan 10 kΩ). Pastikan
-nilai resistor fisik cocok dengan perhitungan sebelum menyalakan rangkaian:
+`**` Beri daya board dari regulator 5 V yang stabil melalui pin 5V/VIN sesuai
+revisi board. Jangan hubungkan keluaran 5 V regulator ke pin 3V3. Hindari
+menyuplai board dari USB dan pin 5V/VIN sekaligus kecuali rangkaian board
+memang mendukungnya.
 
-- Jika memakai **100 kΩ + 10 kΩ**, pertahankan nilai `BATTERY_R2` di kode Nano.
-- Jika memakai **100 kΩ + 15 kΩ**, ubah `BATTERY_R2` di kode Nano menjadi
-  `15000.0`.
+## Tabel pin Wemos
 
-Periksa juga referensi ADC Nano (`ADC_REFERENCE_MILLIVOLTS`, default 5000 mV)
-dan kalibrasikan terhadap tegangan AVcc yang terukur. Jangan hubungkan baterai
-langsung ke pin A0; pastikan tegangan pada pin ADC tidak melampaui batas board.
+| Pin Wemos | Sambungan | Catatan |
+| --- | --- | --- |
+| D1 / GPIO5 | OLED SCL | I2C |
+| D2 / GPIO4 | OLED SDA | I2C; OLED diberi daya 3,3 V agar level I2C cocok |
+| D3 / GPIO0 | Tombol MINUS ke GND | Firmware memakai `INPUT_PULLUP` |
+| D4 / GPIO2 | DS18B20 DATA | Tambahkan pull-up 4,7 kΩ dari DATA ke 3V3 |
+| D5 / GPIO14 | Masukan PWM driver LED | PWM 0–3,3 V; bukan untuk LED berdaya langsung |
+| D6 / GPIO12 | Tombol MAIN ke GND | Firmware memakai `INPUT_PULLUP` |
+| D7 / GPIO13 | Tombol PLUS ke GND | Firmware memakai `INPUT_PULLUP` |
+| D0 / GPIO16 | Masukan PWM driver kipas | Gunakan driver/antarmuka yang sesuai dengan kipas |
+| D8 / GPIO15 | Tidak digunakan | |
+| TX / GPIO1 | Nano D0 / RX | UART 9600 baud, Wemos TX 3,3 V |
+| RX / GPIO3 | Nano D1 / TX melalui pembagi | Jangan masukkan sinyal UART 5 V langsung ke RX Wemos |
 
-## Library dan persiapan
+## Pembaca baterai dan pembagi tegangan
 
-### Wemos D1 mini
-
-Di Arduino IDE, pasang dukungan board **ESP8266** dan library berikut:
-
-- Adafruit GFX Library
-- Adafruit SSD1306
-- OneWire
-- DallasTemperature
-
-`Wire`, `EEPROM`, dan `ESP8266WiFi` disediakan oleh dukungan board ESP8266.
-
-### Arduino Nano
-
-Pilih dukungan board **Arduino AVR Boards**. Sketch Nano menggunakan `stdio.h`
-dan fasilitas serial/ADC Arduino; tidak memerlukan library eksternal tambahan.
-
-## Upload firmware
-
-1. Buka `SENTER_RACING_WEMOS/SENTER_RACING_WEMOS.ino` di Arduino IDE.
-2. Pilih board **LOLIN (WEMOS) D1 mini** (atau board ESP8266 yang sesuai),
-   port COM yang benar, lalu unggah.
-3. Untuk mengunggah ke Nano, buka
-   `NANO_BATTERY_READER/NANO_BATTERY_READER.ino`, pilih **Arduino Nano** dan
-   prosesor/bootloader yang sesuai dengan board, lalu unggah.
-4. Putuskan sambungan serial antar-board saat mengunggah: lepaskan Nano TX dari
-   Wemos RX ketika mengunggah ke Wemos; lepaskan Wemos TX dari Nano RX ketika
-   mengunggah ke Nano.
-5. Setelah upload, sambungkan kembali TX/RX sesuai tabel, pastikan GND bersama,
-   lalu nyalakan sistem.
-
-## Kontrol tombol
-
-- Klik tombol utama 1–5 kali untuk memilih mode **LOW**, **MEDIUM**, **HIGH**,
-  **STROBO**, atau **TURBO**.
-- Saat lampu menyala, tekan singkat tombol utama untuk mematikan lampu.
-- Saat lampu menyala, tahan tombol utama untuk berpindah di antara LOW, MEDIUM,
-  dan HIGH.
-- Tombol tambah/kurang mengatur target output sesuai mode; rincian parameter
-  sistem dapat diakses melalui menu pengaturan pada perangkat.
-
-## Protokol serial Nano–Wemos
-
-Serial berjalan pada **9600 baud**. Wemos mengirim baris:
+Hubungkan baterai positif ke Nano A0 melalui resistor seri 100 kΩ. Hubungkan
+A0 ke ground melalui resistor 10 kΩ. Baterai negatif, Nano GND, dan Wemos GND
+harus menjadi satu ground bersama.
 
 ```text
-Q,<sequence>,<checksum>
+Battery + ---- 100 kΩ ----+---- Nano A0
+                          |
+                         10 kΩ
+                          |
+Battery - ----------------+---- GND bersama
 ```
 
-Nano membalas:
+Dengan nilai yang dipakai oleh program Nano, tegangan pada A0 sekitar 1,15 V
+saat baterai 12,6 V. Jangan sambungkan baterai 3S langsung ke A0. Pastikan
+tegangan A0 tidak melewati batas ADC board Nano.
 
-```text
-R,<sequence>,<millivolt>,<checksum>
-```
+**Penting:** konstanta program Nano menetapkan `R1 = 100 kΩ` dan
+`R2 = 10 kΩ`. Komentar hardware pada header kedua sketch masih menyebut 15 kΩ;
+nilai pada komentar itu sudah tidak cocok dengan perhitungan firmware. Untuk
+firmware saat ini, gunakan 10 kΩ sebagai resistor dari A0 ke GND. Nilai
+resistor pembagi level UART (1 kΩ dan 1,8 kΩ) adalah rangkaian terpisah dan
+tidak boleh tertukar dengan pembagi baterai.
 
-Setiap baris diakhiri newline. Checksum adalah XOR dari semua byte sebelum koma
-terakhir. Wemos meminta data baterai setiap 250 ms.
+## Sambungan UART Nano–Wemos
 
-## Catatan keselamatan
+- Wemos TX ke Nano D0/RX.
+- Nano D1/TX ke Wemos RX melalui pembagi 1 kΩ seri dan 1,8 kΩ dari titik RX
+  Wemos ke GND.
+- Hubungkan GND kedua board.
+- Kedua sketch menggunakan UART 9600 baud.
+- Saat mengunggah firmware ke Nano, lepaskan jalur Wemos TX ke Nano RX.
+- Saat mengunggah firmware ke Wemos, lepaskan jalur Nano TX/pembagi ke Wemos RX.
 
-- Pastikan polaritas baterai, pembagi tegangan, GND bersama, dan level logika
-  telah diperiksa sebelum memberi daya.
-- Jangan menggerakkan LED berarus tinggi langsung dari pin Wemos; gunakan
-  MOSFET/driver yang sesuai dan pendinginan yang memadai.
-- Lepaskan baterai saat melakukan perubahan wiring atau pemrograman.
-- Uji pembacaan tegangan dengan multimeter sebelum mengandalkan fitur proteksi
-  baterai.
+## Catatan perakitan
+
+- Ketiga tombol dipasang antara pin GPIO masing-masing dan GND; tidak perlu
+  resistor pull-up eksternal karena firmware mengaktifkan `INPUT_PULLUP`.
+- DS18B20 memerlukan pull-up 4,7 kΩ antara DATA dan 3V3.
+- OLED memakai I2C pada alamat `0x3C`; suplai 3,3 V menghindari pull-up I2C
+  5 V yang dapat merusak Wemos.
+- Satukan ground catu daya, Wemos, Nano, sensor, dan driver agar sinyal UART
+  serta PWM memiliki referensi yang sama.
+- Pastikan regulator dan kabel mampu menangani arus beban LED/kipas. Jangan
+  mengalirkan arus LED atau kipas melalui pin GPIO maupun regulator onboard
+  Wemos/Nano.
+- Ukur tegangan baterai di A0 sebelum menghubungkan baterai untuk pertama kali.
+
+## Berkas firmware
+
+- [Firmware Arduino Nano](./NANO_BATTERY_READER.ino)
+- [Firmware Wemos D1 Mini](../SENTER_RACING_WEMOS/SENTER_RACING_WEMOS.ino)
