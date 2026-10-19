@@ -142,4 +142,4 @@ tidak boleh tertukar dengan pembagi baterai.
 ## Berkas firmware
 
 - [Firmware Arduino Nano](./NANO_BATTERY_READER.ino)
-- [Firmware Wemos D1 Mini](./SENTER_RACING_WEMOS/SENTER_RACING_WEMOS.ino)
+- [Firmware Wemos D1 Mini](./SENTER_RACING_WEMOS.ino)
