@@ -38,6 +38,56 @@ Regulator OUT+ 5 V ---------------------------+-- Nano 5V
 OLED VCC ---------------- Wemos 3V3
 DS18B20 VDD ------------ Wemos 3V3
 
+MENU SETTINGS
+├── DISPLAY SETTINGS (10)
+│   ├── PWM OUTPUT                         [checkbox]
+│   ├── BATTERY VOLTAGE                    [checkbox]
+│   ├── BATTERY PERCENT                    [checkbox]
+│   ├── POWER WATTS                        [checkbox]
+│   ├── TEMPERATURE                        [checkbox]
+│   ├── FAN STATUS                         [checkbox]
+│   ├── DISPLAY MODE                       [ALWAYS / AUTO LED / TIMEOUT]
+│   ├── DISPLAY TIMEOUT                    [1–60 SEC atau MIN]
+│   ├── BRIGHTNESS                         [1–100%]
+│   └── SCREEN SAVER STYLE                 [OFF / ROBOT / SCAN / SLEEP / EYES / ROLLING]
+│
+├── LED AND POWER (13)
+│   ├── PWM FREQUENCY                      [1–20 kHz]
+│   ├── INVERT LED PWM                     [checkbox]
+│   ├── LED POWER CAPACITY                 [1–100 W]
+│   ├── LOW MODE LIMIT                     [1–30%]
+│   ├── MEDIUM MODE LIMIT                  [1–50%]
+│   ├── HIGH MODE LIMIT                    [1–75%]
+│   ├── TURBO POWER LIMIT                  [1–100%]
+│   ├── TURBO TIME LIMIT                   [OFF / 5–180 SEC]
+│   ├── FADE IN                            [checkbox]
+│   ├── FADE IN DURATION                   [1–10 SEC]
+│   ├── FADE OUT                           [checkbox]
+│   ├── FADE OUT DURATION                  [1–10 SEC]
+│   └── STROBE FREQUENCY                   [1–30 Hz]
+│
+├── FAN AND TEMPERATURE (9)
+│   ├── INVERT FAN PWM                     [checkbox]
+│   ├── FAN TEMP LIMIT                     [45–80 °C]
+│   ├── FAN START TEMP                     [35–75 °C]
+│   ├── FAN STOP TEMP                      [25–70 °C]
+│   ├── FAN MIN SPEED                      [0–70%]
+│   ├── FAN MAX SPEED                      [20–100%]
+│   ├── LED TEMP LIMIT                     [65–82 °C]
+│   ├── TURBO FAN MODE                     [AUTO / BOOST]
+│   └── TURBO FAN START                    [0–100%]
+│
+├── BATTERY SETTINGS (4)
+│   ├── BATTERY CALIBRATION                [tegangan RAW dan ADJUSTED live; +/-]
+│   ├── BATTERY TYPE                       [LiFePO4 / Polymer / Lithium]
+│   ├── CELLS IN SERIES                    [1S–4S]
+│   └── BATTERY POWER LIMIT                [1–50%]
+│       Warning/cutoff/recovery voltage ditentukan otomatis oleh tipe dan jumlah seri.
+│
+└── SYSTEM (1)
+    └── RESET ALL SETTINGS
+
+
 WEMOS D1 MINI / ESP8266
 =======================
 D1 / GPIO5  ---------------- OLED SCL
