@@ -38,6 +38,31 @@ Regulator OUT+ 5 V ---------------------------+-- Nano 5V
 OLED VCC ---------------- Wemos 3V3
 DS18B20 VDD ------------ Wemos 3V3
 
+
+
+WEMOS D1 MINI / ESP8266
+=======================
+D1 / GPIO5  ---------------- OLED SCL
+D2 / GPIO4  ---------------- OLED SDA
+D3 / GPIO0  ---------------- Tombol MINUS ---- GND
+D4 / GPIO2  ---------------- DS18B20 DATA
+                              |
+                             4,7 kΩ
+                              |
+                             3V3
+D5 / GPIO14 PWM ------------ Driver LED (input PWM)
+D6 / GPIO12 --------------- Tombol MAIN ------ GND
+D7 / GPIO13 --------------- Tombol PLUS ------ GND
+D0 / GPIO16 PWM ------------ Driver kipas (input PWM)
+D8 / GPIO15 ---------------- Tidak digunakan
+TX / GPIO1 ----------------- Nano D0 / RX
+RX / GPIO3 <----------------+---- 1 kΩ ---- Nano D1 / TX
+                            |
+                           1,8 kΩ
+                            |
+                           GND
+```
+
 MENU SETTINGS
 ├── DISPLAY SETTINGS (10)
 │   ├── PWM OUTPUT                         [checkbox]
@@ -86,30 +111,6 @@ MENU SETTINGS
 │
 └── SYSTEM (1)
     └── RESET ALL SETTINGS
-
-
-WEMOS D1 MINI / ESP8266
-=======================
-D1 / GPIO5  ---------------- OLED SCL
-D2 / GPIO4  ---------------- OLED SDA
-D3 / GPIO0  ---------------- Tombol MINUS ---- GND
-D4 / GPIO2  ---------------- DS18B20 DATA
-                              |
-                             4,7 kΩ
-                              |
-                             3V3
-D5 / GPIO14 PWM ------------ Driver LED (input PWM)
-D6 / GPIO12 --------------- Tombol MAIN ------ GND
-D7 / GPIO13 --------------- Tombol PLUS ------ GND
-D0 / GPIO16 PWM ------------ Driver kipas (input PWM)
-D8 / GPIO15 ---------------- Tidak digunakan
-TX / GPIO1 ----------------- Nano D0 / RX
-RX / GPIO3 <----------------+---- 1 kΩ ---- Nano D1 / TX
-                            |
-                           1,8 kΩ
-                            |
-                           GND
-```
 
 `*` Daya untuk LED dan kipas mengikuti spesifikasi bebannya dan driver yang
 digunakan. Jangan mengalirkan arus beban langsung melalui pin Wemos. Gunakan
