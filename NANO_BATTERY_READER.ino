@@ -18,6 +18,7 @@
 
   The Wemos sends Q,<sequence>,<checksum>. The Nano replies with
   R,<sequence>,<battery millivolts>,<checksum>. Both lines end with newline.
+  P,<checksum> pauses battery sampling; W,<checksum> resumes it.
   The checksum is the XOR of all bytes before the final comma.
 */
 #include <stdio.h>
@@ -33,6 +34,7 @@ const uint32_t BATTERY_MAX_MILLIVOLTS = 16000UL;
 char requestBuffer[20];
 uint8_t requestLength = 0;
 bool requestOverflow = false;
+bool samplingPaused = false;
 
 uint8_t serialChecksum(const char *data, uint8_t length) {
   uint8_t checksum = 0;
@@ -106,11 +108,10 @@ void sendBatteryResponse(uint32_t sequence) {
 }
 
 void processRequest() {
-  if (requestOverflow || requestLength < 5) return;
-  if (requestBuffer[0] != 'Q' || requestBuffer[1] != ',') return;
+  if (requestOverflow || requestLength < 3) return;
 
   uint8_t checksumSeparator = requestLength;
-  for (uint8_t i = 2; i < requestLength; i++) {
+  for (uint8_t i = 1; i < requestLength; i++) {
     if (requestBuffer[i] == ',') checksumSeparator = i;
   }
   if (checksumSeparator >= requestLength) return;
@@ -126,6 +127,18 @@ void processRequest() {
         receivedChecksum
       )) return;
   if (receivedChecksum != serialChecksum(requestBuffer, checksumSeparator)) return;
+
+  if (checksumSeparator == 1 &&
+      requestBuffer[1] == ',' &&
+      (requestBuffer[0] == 'P' || requestBuffer[0] == 'W')) {
+    samplingPaused = requestBuffer[0] == 'P';
+    return;
+  }
+
+  if (samplingPaused ||
+      requestLength < 5 ||
+      requestBuffer[0] != 'Q' ||
+      requestBuffer[1] != ',') return;
 
   uint8_t position = 2;
   uint32_t sequence = 0;
