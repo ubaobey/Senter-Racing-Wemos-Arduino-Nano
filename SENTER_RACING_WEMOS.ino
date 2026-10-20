@@ -2,22 +2,21 @@
   ============================================================
             SENTER RACING - MAIN FIRMWARE
             ESP8266 / Wemos D1 Mini
-            VERSION - LiPo 3S
+            BATTERY PROFILE CONFIGURABLE
   ============================================================
   BATTERY
   ------------------------------------------------------------
-  LiPo 3S
-  FULL      = 12.60V
-  NOMINAL   = 11.10V
-  CRITICAL  = 9.00V
-  RECOVERY  = 10.80V
+  Battery chemistry and series count are selected in BATTERY SETTINGS.
+  LiFePO4: 3.2V nominal, 3.65V full, 3.2V warning, 2.8V cutoff per cell.
+  LiPo/Li-ion: 4.2V full, 3.5V warning, 3.0V cutoff per cell.
+  Voltage thresholds and battery percentage scale with the selected series count.
 
   VOLTAGE DIVIDER (DI ARDUINO NANO)
   ------------------------------------------------------------
   R1 = 100K
   R2 = 15K
 
-  12.60V battery -> sekitar 1.64V ke A0 Nano
+  16.80V battery -> sekitar 2.20V ke A0 Nano (4S LiPo maximum)
   Wemos meminta data baterai dari Nano setiap 250 ms.
   Nano membalas request dengan sequence dan nilai millivolt.
 
@@ -36,7 +35,8 @@
   TX  -> Nano D0/RX (9600 baud; logika 3.3V Wemos aman untuk Nano)
 
   Wemos sends Q,<sequence>,<checksum>; Nano replies with
-  R,<sequence>,<millivolts>,<checksum>. Checksum is XOR before final comma.
+  R,<sequence>,<millivolts>,<checksum>. P and W control Nano sampling.
+  Checksum is XOR before final comma.
 
   NANO DISCONNECTED
   ------------------------------------------------------------
@@ -71,6 +71,7 @@
 #include <EEPROM.h>
 #include <ESP8266WiFi.h>
 #include <stdio.h>
+#include <string.h>
 bool ledOn = false;
 float userLEDTarget = 0.0;
 float ledPWM = 0.0;
@@ -124,22 +125,42 @@ bool turboTimeoutApplied = false;
 #define BATTERY_SERIAL_TIMEOUT 1000UL
 #define NANO_CONNECTION_TIMEOUT 6000UL
 #define BATTERY_REQUEST_INTERVAL 250UL
-#define BATTERY_MAX_MILLIVOLTS 16000UL
+#define BATTERY_MAX_MILLIVOLTS 20000UL
 #define BATTERY_FILTER_ALPHA 0.30
-#define BATTERY_FULL_VOLTAGE      12.60
-#define BATTERY_NOMINAL_VOLTAGE   11.10
-#define BATTERY_CRITICAL_DEFAULT  9.00
-float criticalBatteryVoltage = BATTERY_CRITICAL_DEFAULT;
-#define BATTERY_RECOVERY_DEFAULT  10.80
-float recoveryBatteryVoltage = BATTERY_RECOVERY_DEFAULT;
 #define BATTERY_READ_INTERVAL 250
-#define BATTERY_LOW_PERCENT_DEFAULT 20
-float lowBatteryWarningVoltage = 11.00;
 uint8_t lowBatteryOutputLimit = 15;
 #define BATTERY_BLINK_INTERVAL 500
+enum BatteryChemistry : uint8_t {
+  BATTERY_LIFEPO4 = 0,
+  BATTERY_POLYMER,
+  BATTERY_LITHIUM
+};
+BatteryChemistry batteryChemistry = BATTERY_POLYMER;
+uint8_t batterySeriesCount = 3;
+
+float getBatteryCellFullVoltage() {
+  return batteryChemistry == BATTERY_LIFEPO4 ? 3.65f : 4.20f;
+}
+
+float getBatteryWarningVoltage() {
+  float cellVoltage = batteryChemistry == BATTERY_LIFEPO4 ? 3.20f : 3.50f;
+  return cellVoltage * batterySeriesCount;
+}
+
+float getBatteryCriticalVoltage() {
+  float cellVoltage = batteryChemistry == BATTERY_LIFEPO4 ? 2.80f : 3.00f;
+  return cellVoltage * batterySeriesCount;
+}
+
+float getBatteryRecoveryVoltage() {
+  float cellVoltage = batteryChemistry == BATTERY_LIFEPO4 ? 3.10f : 3.30f;
+  return cellVoltage * batterySeriesCount;
+}
+
 float batteryVoltage = 0.0;
 float filteredBatteryVoltage = -1.0;
 float batteryDisplayVoltage = -1.0;  // Filter khusus tampilan OLED agar angka desimal stabil.
+bool batteryCalibrationDirty = false;
 int batteryPercent = 0;
 bool batteryCritical = false;
 bool batteryPresent = false;
@@ -152,6 +173,13 @@ uint16_t lastBatteryRequestSequence = 0;
 unsigned long lastBatteryRequestAt = 0;
 bool batteryRequestSent = false;
 bool batteryRequestPending = false;
+bool nanoPaused = false;
+bool nanoWakePending = false;
+bool freshBatteryRequired = false;
+bool mainScreenRequested = false;
+uint8_t pendingMainClicks = 0;
+unsigned long nanoWakeStartedAt = 0;
+#define NANO_WAKE_TIMEOUT 1500UL
 char batterySerialBuffer[24];
 uint8_t batterySerialLength = 0;
 bool batterySerialOverflow = false;
@@ -212,7 +240,7 @@ float getModeMax() {
 
 float getEffectiveModeMax() {
   if (batteryCritical) return min(getModeMax(), (float)lowBatteryOutputLimit);
-  if (batteryPresent && batteryVoltage > criticalBatteryVoltage && batteryVoltage <= lowBatteryWarningVoltage) {
+  if (batteryPresent && batteryVoltage > getBatteryCriticalVoltage() && batteryVoltage <= getBatteryWarningVoltage()) {
     return min(getModeMax(), (float)lowBatteryOutputLimit);
   }
   return getModeMax();
@@ -281,8 +309,13 @@ uint8_t settingResetChoice = 0; // 0=cancel, 1=confirm reset
 uint8_t settingPage = 0;
 uint8_t settingCategoryIndex = 0;
 uint8_t settingSubmenuIndex = 0;
-uint8_t settingMenuIndex = 0; // current flat setting ID, used by the editor
 uint8_t settingEditField = 0;
+float settingScrollPosition = 0.0f;
+unsigned long settingScrollUpdatedAt = 0;
+uint8_t settingScrollPage = 255;
+uint8_t settingScrollCategory = 255;
+float settingValueScrollPosition = 0.0f;
+unsigned long settingValueScrollUpdatedAt = 0;
 #define SETTING_HOLD_TIME 5000UL
 #define EEPROM_FAN_LIMIT_ADDR 40
 #define EEPROM_BATTERY_CAL_ADDR 44
@@ -311,15 +344,25 @@ uint8_t settingEditField = 0;
 #define EEPROM_FAN_STOP_TEMP_ADDR 98
 #define EEPROM_FAN_MAX_SPEED_ADDR 102
 #define EEPROM_LED_TEMP_LIMIT_ADDR 104
-#define EEPROM_LOW_BATT_WARN_ADDR 108
 #define EEPROM_LOW_BATT_LIMIT_ADDR 112
-#define EEPROM_CRITICAL_VOLT_ADDR 116
-#define EEPROM_RECOVERY_VOLT_ADDR 120
 #define EEPROM_PWM_FREQUENCY_ADDR 124
 #define EEPROM_TURBO_FAN_MODE_ADDR 125
 #define EEPROM_TURBO_FAN_START_ADDR 126
+#define EEPROM_SCREEN_SAVER_ADDR 127
+#define EEPROM_INVERT_LED_PWM_ADDR 128
+#define EEPROM_INVERT_FAN_PWM_ADDR 129
+#define EEPROM_BATTERY_CHEMISTRY_ADDR 132
+#define EEPROM_BATTERY_SERIES_ADDR 133
 uint8_t pwmFrequencyKHz = PWM_FREQUENCY_DEFAULT_KHZ;
 bool pwmFrequencyDirty = false;
+bool invertLedPWM = false;
+bool invertFanPWM = false;
+void writeFanPWMOutput(int percent) {
+  percent = constrain(percent, 0, 100);
+  int pwm = (int)round((percent / 100.0f) * PWM_MAX);
+  if (invertFanPWM) pwm = PWM_MAX - pwm;
+  analogWrite(FAN_PWM_PIN, pwm);
+}
 float fanTempLimit = 70.0; // retained for compatibility with existing config
 float fanStartTemp = 45.0;
 float fanStopTemp = 40.0;
@@ -340,6 +383,8 @@ uint8_t oledBrightness = 70; // 1-100%
 uint8_t displayTimeoutValue = 1;
 bool displayTimeoutInMinutes = false;
 uint8_t displayMode = 2;
+uint8_t screenSaverStyle = 1;
+uint8_t rollingScreenSaverStyle = 0;
 bool showPWM = true;
 bool showVoltage = true;
 bool showBatteryPercent = true;
@@ -365,8 +410,6 @@ bool settingMinusStable = HIGH;
 unsigned long settingMinusDebounceAt = 0;
 unsigned long settingMinusRepeatAt = 0;
 #define SETTING_DEBOUNCE_MS 25
-#define SETTING_MENU_COUNT 15
-#define SETTING_VISIBLE_ROWS 5
 #define THERMAL_START 75.0
 #define THERMAL_CUTOFF 85.0 // independent hard safety cutoff
 float ledTempLimit = 75.0;
@@ -377,6 +420,9 @@ bool safeMode = false;
 bool tempFault = false;
 bool coolingFault = false;
 bool oledDisplayActive = true;
+bool lowBatteryAlertActive = false;
+unsigned long lowBatteryAlertStartedAt = 0;
+#define LOW_BATTERY_ALERT_DURATION 3000UL
 #define OLED_OFF_DELAY 3000
 unsigned long lastWarningBlink = 0;
 bool warningBlinkState = true;
@@ -425,6 +471,7 @@ unsigned long lastDisplay = 0;
 const unsigned long TEMP_INTERVAL = 1000;
 const unsigned long THERMAL_INTERVAL = 1000;
 const unsigned long DISPLAY_INTERVAL = 250;
+const unsigned long SETTING_DISPLAY_INTERVAL = 80;
 float getSafetyTarget() {
   float target =
     userLEDTarget;
@@ -435,7 +482,7 @@ float getSafetyTarget() {
     return 0.0;
   }
   // Soft low-battery output ceiling; critical protection below still forces OFF.
-  if (batteryPresent && batteryVoltage > criticalBatteryVoltage && batteryVoltage <= lowBatteryWarningVoltage) {
+  if (batteryPresent && batteryVoltage > getBatteryCriticalVoltage() && batteryVoltage <= getBatteryWarningVoltage()) {
     target = min(target, (float)lowBatteryOutputLimit);
   }
   if (batteryCritical) {
@@ -455,11 +502,46 @@ float getSafetyTarget() {
   return target;
 }
 
+bool hasFreshZeroBatteryReading() {
+  return batteryPacketReceived &&
+         receivedBatteryMillivolts == 0 &&
+         millis() - lastBatteryPacketAt <= BATTERY_SERIAL_TIMEOUT;
+}
+
+bool isBatteryLow() {
+  return batteryCritical ||
+         hasFreshZeroBatteryReading() ||
+         (batteryPresent && batteryVoltage <= getBatteryWarningVoltage());
+}
+
+void startLowBatteryAlert() {
+  lowBatteryAlertActive = true;
+  lowBatteryAlertStartedAt = millis();
+  oledIdleSince = lowBatteryAlertStartedAt;
+  oledDisplayActive = true;
+  if (oledOK) {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+  }
+}
+
 void executeMainClicks() {
   uint8_t clicks = mainClickCount;
   mainClickCount = 0;
   mainLastRelease = 0;
   if (clicks == 0) {
+    return;
+  }
+  bool requestsLight = clicks > 1 || !ledOn;
+  if (requestsLight && (!nanoConnected || freshBatteryRequired)) {
+    if (nanoWakePending) pendingMainClicks = clicks;
+    else mainScreenRequested = false;
+    return;
+  }
+  mainScreenRequested = false;
+  if (requestsLight && isBatteryLow()) {
+    startLowBatteryAlert();
+  }
+  if (requestsLight && (batteryCritical || hasFreshZeroBatteryReading())) {
     return;
   }
   if (clicks == 1) {
@@ -580,7 +662,7 @@ void forceSettingOutputsOff() {
   outputLEDPWM(0);
   fanPWM = 0;
   lastFanPWMOutput = 0;
-  analogWrite(FAN_PWM_PIN, 0);
+  writeFanPWMOutput(0);
   oledDisplayActive = true;
   if (oledOK) display.ssd1306_command(SSD1306_DISPLAYON);
 }
@@ -589,27 +671,30 @@ enum SettingId : uint8_t {
   SET_TURBO_OUTPUT, SET_TURBO_TIMEOUT, SET_FADE_IN_ENABLE, SET_FADE_IN_TIME,
   SET_FADE_OUT_ENABLE, SET_FADE_OUT_TIME, SET_FAN_TEMP_LIMIT, SET_FAN_START_TEMP,
   SET_FAN_STOP_TEMP, SET_FAN_MIN_SPEED, SET_FAN_MAX_SPEED, SET_LED_TEMP_LIMIT,
-  SET_BATTERY_CAL, SET_LOW_BATT_WARNING, SET_LOW_BATT_LIMIT, SET_CRITICAL_VOLTAGE,
-  SET_RECOVERY_VOLTAGE, SET_SHOW_PWM, SET_SHOW_VOLTAGE, SET_SHOW_BATTERY_PERCENT,
+  SET_BATTERY_CAL, SET_BATTERY_CHEMISTRY, SET_BATTERY_SERIES, SET_LOW_BATT_LIMIT,
+  SET_SHOW_PWM, SET_SHOW_VOLTAGE, SET_SHOW_BATTERY_PERCENT,
   SET_SHOW_POWER, SET_SHOW_TEMPERATURE, SET_SHOW_FAN, SET_DISPLAY_MODE,
   SET_DISPLAY_TIMEOUT, SET_OLED_BRIGHTNESS, SET_TURBO_FAN_MODE,
   SET_TURBO_FAN_START, SET_RESET_DEFAULTS,
+  SET_SCREEN_SAVER,
+  SET_INVERT_LED_PWM, SET_INVERT_FAN_PWM,
   SETTING_TOTAL_COUNT
-};
-const char *settingCategoryLabels[] = {
-  "DISPLAY SETTINGS", "LED & POWER", "FAN & TEMPT", "BATTERY SETTINGS", "SYSTEM"
 };
 #define SETTING_CATEGORY_COUNT 5
 
-const uint8_t settingCategoryItems[SETTING_CATEGORY_COUNT][12] = {
-  {SET_SHOW_PWM, SET_SHOW_VOLTAGE, SET_SHOW_BATTERY_PERCENT, SET_SHOW_POWER, SET_SHOW_TEMPERATURE, SET_SHOW_FAN, SET_DISPLAY_MODE, SET_DISPLAY_TIMEOUT, SET_OLED_BRIGHTNESS, 255, 255},
-  {SET_PWM_FREQUENCY, SET_LED_WATT, SET_LOW_OUTPUT, SET_MED_OUTPUT, SET_HIGH_OUTPUT, SET_TURBO_OUTPUT, SET_TURBO_TIMEOUT, SET_FADE_IN_ENABLE, SET_FADE_IN_TIME, SET_FADE_OUT_ENABLE, SET_FADE_OUT_TIME, SET_STROBE_SPEED},
-  {SET_FAN_TEMP_LIMIT, SET_FAN_START_TEMP, SET_FAN_STOP_TEMP, SET_FAN_MIN_SPEED, SET_FAN_MAX_SPEED, SET_LED_TEMP_LIMIT, SET_TURBO_FAN_MODE, SET_TURBO_FAN_START, 255, 255, 255, 255},
-  {SET_BATTERY_CAL, SET_LOW_BATT_WARNING, SET_LOW_BATT_LIMIT, SET_CRITICAL_VOLTAGE, SET_RECOVERY_VOLTAGE, 255, 255, 255, 255, 255, 255},
-  {SET_RESET_DEFAULTS, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255}
+const char *settingCategoryLabels[SETTING_CATEGORY_COUNT] = {
+  "DISPLAY SETTINGS", "LED AND POWER", "FAN AND TEMPERATURE", "BATTERY SETTINGS", "SYSTEM"
 };
 
-const uint8_t settingCategoryItemCounts[SETTING_CATEGORY_COUNT] = {9, 12, 8, 5, 1};
+const uint8_t settingCategoryItems[SETTING_CATEGORY_COUNT][13] = {
+  {SET_SHOW_PWM, SET_SHOW_VOLTAGE, SET_SHOW_BATTERY_PERCENT, SET_SHOW_POWER, SET_SHOW_TEMPERATURE, SET_SHOW_FAN, SET_DISPLAY_MODE, SET_DISPLAY_TIMEOUT, SET_OLED_BRIGHTNESS, SET_SCREEN_SAVER, 255, 255},
+  {SET_PWM_FREQUENCY, SET_INVERT_LED_PWM, SET_LED_WATT, SET_LOW_OUTPUT, SET_MED_OUTPUT, SET_HIGH_OUTPUT, SET_TURBO_OUTPUT, SET_TURBO_TIMEOUT, SET_FADE_IN_ENABLE, SET_FADE_IN_TIME, SET_FADE_OUT_ENABLE, SET_FADE_OUT_TIME, SET_STROBE_SPEED},
+  {SET_INVERT_FAN_PWM, SET_FAN_TEMP_LIMIT, SET_FAN_START_TEMP, SET_FAN_STOP_TEMP, SET_FAN_MIN_SPEED, SET_FAN_MAX_SPEED, SET_LED_TEMP_LIMIT, SET_TURBO_FAN_MODE, SET_TURBO_FAN_START, 255, 255, 255, 255},
+  {SET_BATTERY_CAL, SET_BATTERY_CHEMISTRY, SET_BATTERY_SERIES, SET_LOW_BATT_LIMIT, 255, 255, 255, 255, 255, 255, 255},
+  {SET_RESET_DEFAULTS, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255}
+};
+
+const uint8_t settingCategoryItemCounts[SETTING_CATEGORY_COUNT] = {10, 13, 9, 4, 1};
 uint8_t getCurrentSettingId() {
   if (settingCategoryIndex >= SETTING_CATEGORY_COUNT) return SET_STROBE_SPEED;
   if (settingSubmenuIndex >= settingCategoryItemCounts[settingCategoryIndex]) return SET_STROBE_SPEED;
@@ -617,42 +702,138 @@ uint8_t getCurrentSettingId() {
 }
 const char *getSettingLabel(uint8_t id) {
   switch (id) {
-    case SET_SHOW_PWM: return "PWM";
-    case SET_SHOW_VOLTAGE: return "VOLT";
-    case SET_SHOW_BATTERY_PERCENT: return "BATT %";
-    case SET_SHOW_POWER: return "WATT";
-    case SET_SHOW_TEMPERATURE: return "TEMPT";
-    case SET_SHOW_FAN: return "FAN";
+    case SET_SHOW_PWM: return "PWM OUTPUT";
+    case SET_SHOW_VOLTAGE: return "BATTERY VOLTAGE";
+    case SET_SHOW_BATTERY_PERCENT: return "BATTERY PERCENT";
+    case SET_SHOW_POWER: return "POWER WATTS";
+    case SET_SHOW_TEMPERATURE: return "TEMPERATURE";
+    case SET_SHOW_FAN: return "FAN STATUS";
     case SET_DISPLAY_MODE: return "DISPLAY MODE";
-    case SET_DISPLAY_TIMEOUT: return "TIMEOUT";
+    case SET_DISPLAY_TIMEOUT: return "DISPLAY TIMEOUT";
+    case SET_SCREEN_SAVER: return "SCREEN SAVER STYLE";
+    case SET_INVERT_LED_PWM: return "INVERT LED PWM";
+    case SET_INVERT_FAN_PWM: return "INVERT FAN PWM";
     case SET_OLED_BRIGHTNESS: return "BRIGHTNESS";
     case SET_PWM_FREQUENCY: return "PWM FREQUENCY";
-    case SET_LED_WATT: return "WATT CAPACITY";
-    case SET_LOW_OUTPUT: return "LOW LIMIT";
-    case SET_MED_OUTPUT: return "MED LIMIT";
-    case SET_HIGH_OUTPUT: return "HIGH LIMIT";
-    case SET_TURBO_OUTPUT: return "POWER LIMIT";
-    case SET_TURBO_TIMEOUT: return "TURBO TIMEOUT";
+    case SET_LED_WATT: return "LED POWER CAPACITY";
+    case SET_LOW_OUTPUT: return "LOW MODE LIMIT";
+    case SET_MED_OUTPUT: return "MEDIUM MODE LIMIT";
+    case SET_HIGH_OUTPUT: return "HIGH MODE LIMIT";
+    case SET_TURBO_OUTPUT: return "TURBO POWER LIMIT";
+    case SET_TURBO_TIMEOUT: return "TURBO TIME LIMIT";
     case SET_FADE_IN_ENABLE: return "FADE IN";
-    case SET_FADE_IN_TIME: return "FADE IN SPEED";
+    case SET_FADE_IN_TIME: return "FADE IN DURATION";
     case SET_FADE_OUT_ENABLE: return "FADE OUT";
-    case SET_FADE_OUT_TIME: return "FADE OUT SPEED";
-    case SET_STROBE_SPEED: return "STROBE SPEED";
-    case SET_FAN_START_TEMP: return "FAN START C";
-    case SET_FAN_STOP_TEMP: return "FAN STOP C";
-    case SET_FAN_MIN_SPEED: return "FAN MIN %";
-    case SET_FAN_MAX_SPEED: return "FAN MAX %";
-    case SET_FAN_TEMP_LIMIT: return "FAN MAX TEMP";
+    case SET_FADE_OUT_TIME: return "FADE OUT DURATION";
+    case SET_STROBE_SPEED: return "STROBE FREQUENCY";
+    case SET_FAN_START_TEMP: return "FAN START TEMP";
+    case SET_FAN_STOP_TEMP: return "FAN STOP TEMP";
+    case SET_FAN_MIN_SPEED: return "FAN MIN SPEED";
+    case SET_FAN_MAX_SPEED: return "FAN MAX SPEED";
+    case SET_FAN_TEMP_LIMIT: return "FAN TEMP LIMIT";
     case SET_LED_TEMP_LIMIT: return "LED TEMP LIMIT";
     case SET_TURBO_FAN_MODE: return "TURBO FAN MODE";
-    case SET_TURBO_FAN_START: return "TURBO START %";
-    case SET_BATTERY_CAL: return "VOLT CAL";
-    case SET_LOW_BATT_WARNING: return "LOW BATT WARN";
-    case SET_LOW_BATT_LIMIT: return "LOW BATT LIMIT";
-    case SET_CRITICAL_VOLTAGE: return "CRITICAL VOLT";
-    case SET_RECOVERY_VOLTAGE: return "RECOVERY VOLT";
-    case SET_RESET_DEFAULTS: return "RESET ALL DEFAULT";
+    case SET_TURBO_FAN_START: return "TURBO FAN START";
+    case SET_BATTERY_CAL: return "BATTERY CALIBRATION";
+    case SET_BATTERY_CHEMISTRY: return "BATTERY TYPE";
+    case SET_BATTERY_SERIES: return "CELLS IN SERIES";
+    case SET_LOW_BATT_LIMIT: return "BATTERY POWER LIMIT";
+    case SET_RESET_DEFAULTS: return "RESET ALL SETTINGS";
     default: return "SETTING";
+  }
+}
+
+bool isCheckboxSetting(uint8_t id) {
+  switch (id) {
+    case SET_SHOW_PWM:
+    case SET_SHOW_VOLTAGE:
+    case SET_SHOW_BATTERY_PERCENT:
+    case SET_SHOW_POWER:
+    case SET_SHOW_TEMPERATURE:
+    case SET_SHOW_FAN:
+    case SET_INVERT_LED_PWM:
+    case SET_INVERT_FAN_PWM:
+    case SET_FADE_IN_ENABLE:
+    case SET_FADE_OUT_ENABLE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isCheckboxSettingEnabled(uint8_t id) {
+  switch (id) {
+    case SET_SHOW_PWM: return showPWM;
+    case SET_SHOW_VOLTAGE: return showVoltage;
+    case SET_SHOW_BATTERY_PERCENT: return showBatteryPercent;
+    case SET_SHOW_POWER: return showPowerWatt;
+    case SET_SHOW_TEMPERATURE: return showTemperature;
+    case SET_SHOW_FAN: return showFanStatus;
+    case SET_INVERT_LED_PWM: return invertLedPWM;
+    case SET_INVERT_FAN_PWM: return invertFanPWM;
+    case SET_FADE_IN_ENABLE: return fadeEnabled;
+    case SET_FADE_OUT_ENABLE: return fadeOutEnabled;
+    default: return false;
+  }
+}
+
+void formatSettingOption(uint8_t id, int8_t offset, char *value, size_t valueSize) {
+  switch (id) {
+    case SET_DISPLAY_MODE: {
+        uint8_t option = (displayMode + 3 + offset) % 3;
+        snprintf(value, valueSize, "%s", option == 0 ? "ALWAYS" : option == 1 ? "AUTO LED" : "TIMEOUT");
+        break;
+      }
+    case SET_DISPLAY_TIMEOUT:
+      if (settingEditField == 0) snprintf(value, valueSize, "%u %s", (unsigned)constrain((int)displayTimeoutValue + offset, 1, 60), displayTimeoutInMinutes ? "MIN" : "SEC");
+      else snprintf(value, valueSize, "%s", ((offset + (displayTimeoutInMinutes ? 1 : 0) + 2) % 2) ? "MINUTES" : "SECONDS");
+      break;
+    case SET_SCREEN_SAVER: {
+        uint8_t option = (screenSaverStyle + 6 + offset) % 6;
+        const char *labels[] = {"OFF", "ROBOT", "SCAN", "SLEEP", "EYES", "ROLLING"};
+        snprintf(value, valueSize, "%s", labels[option]);
+        break;
+      }
+    case SET_INVERT_LED_PWM: snprintf(value, valueSize, "%s", (invertLedPWM != ((offset % 2) != 0)) ? "ON" : "OFF"); break;
+    case SET_INVERT_FAN_PWM: snprintf(value, valueSize, "%s", (invertFanPWM != ((offset % 2) != 0)) ? "ON" : "OFF"); break;
+    case SET_OLED_BRIGHTNESS: snprintf(value, valueSize, "%u%%", (unsigned)constrain((int)oledBrightness + offset * 5, 1, 100)); break;
+    case SET_PWM_FREQUENCY: snprintf(value, valueSize, "%u KHZ", (unsigned)constrain((int)pwmFrequencyKHz + offset, PWM_FREQUENCY_MIN_KHZ, PWM_FREQUENCY_MAX_KHZ)); break;
+    case SET_LED_WATT: snprintf(value, valueSize, "%.0f W", constrain(ledWattCapacity + offset, 1.0, 100.0)); break;
+    case SET_LOW_OUTPUT: snprintf(value, valueSize, "%.0f%%", constrain(lowOutputLimit + offset, 1.0, 30.0)); break;
+    case SET_MED_OUTPUT: snprintf(value, valueSize, "%.0f%%", constrain(mediumOutputLimit + offset, 1.0, 50.0)); break;
+    case SET_HIGH_OUTPUT: snprintf(value, valueSize, "%.0f%%", constrain(highOutputLimit + offset, 1.0, 75.0)); break;
+    case SET_TURBO_OUTPUT: snprintf(value, valueSize, "%.0f%%", constrain(turboOutputLimit + offset, 1.0, 100.0)); break;
+    case SET_TURBO_TIMEOUT: {
+        int option = constrain((int)turboTimeoutSec + offset * 5, 0, 180);
+        if (option == 0) snprintf(value, valueSize, "OFF");
+        else snprintf(value, valueSize, "%d SEC", option);
+        break;
+      }
+    case SET_FADE_IN_ENABLE: snprintf(value, valueSize, "%s", (fadeEnabled != ((offset % 2) != 0)) ? "ON" : "OFF"); break;
+    case SET_FADE_IN_TIME: snprintf(value, valueSize, "%u SEC", (unsigned)constrain((int)fadeDurationSec + offset, 1, 10)); break;
+    case SET_FADE_OUT_ENABLE: snprintf(value, valueSize, "%s", (fadeOutEnabled != ((offset % 2) != 0)) ? "ON" : "OFF"); break;
+    case SET_FADE_OUT_TIME: snprintf(value, valueSize, "%u SEC", (unsigned)constrain((int)fadeOutDurationSec + offset, 1, 10)); break;
+    case SET_STROBE_SPEED: snprintf(value, valueSize, "%u HZ", (unsigned)constrain((int)strobeSpeedHz + offset, STROBE_SPEED_MIN, STROBE_SPEED_MAX)); break;
+    case SET_FAN_TEMP_LIMIT: snprintf(value, valueSize, "%.0f C", constrain(fanTempLimit + offset, 45.0, 80.0)); break;
+    case SET_FAN_START_TEMP: snprintf(value, valueSize, "%.0f C", constrain(fanStartTemp + offset, max(35.0, fanStopTemp + 1.0), 75.0)); break;
+    case SET_FAN_STOP_TEMP: snprintf(value, valueSize, "%.0f C", constrain(fanStopTemp + offset, 25.0, min(70.0, fanStartTemp - 1.0))); break;
+    case SET_FAN_MIN_SPEED: snprintf(value, valueSize, "%u%%", (unsigned)constrain((int)fanMinSpeed + offset * 5, 0, (int)fanMaxSpeed)); break;
+    case SET_FAN_MAX_SPEED: snprintf(value, valueSize, "%u%%", (unsigned)constrain((int)fanMaxSpeed + offset * 5, (int)max((uint8_t)fanMinSpeed, (uint8_t)20), 100)); break;
+    case SET_LED_TEMP_LIMIT: snprintf(value, valueSize, "%.0f C", constrain(ledTempLimit + offset, 65.0, 82.0)); break;
+    case SET_TURBO_FAN_MODE: snprintf(value, valueSize, "%s", (turboFanBoostEnabled != ((offset % 2) != 0)) ? "BOOST" : "AUTO"); break;
+    case SET_TURBO_FAN_START: snprintf(value, valueSize, "%u%%", (unsigned)constrain((int)turboFanStartSpeed + offset * 5, 0, 100)); break;
+    case SET_BATTERY_CAL: snprintf(value, valueSize, "%+.2f V", round(constrain(batteryCalOffset + 0.01 * offset, -8.0, 2.0) * 100.0) / 100.0); break;
+    case SET_BATTERY_CHEMISTRY: {
+        uint8_t option = (batteryChemistry + 3 + offset) % 3;
+        const char *labels[] = {"LIFEPO4", "POLYMER", "LITHIUM"};
+        snprintf(value, valueSize, "%s", labels[option]);
+        break;
+      }
+    case SET_BATTERY_SERIES:
+      snprintf(value, valueSize, "%uS", (unsigned)constrain((int)batterySeriesCount + offset, 1, 4));
+      break;
+    case SET_LOW_BATT_LIMIT: snprintf(value, valueSize, "%u%%", (unsigned)constrain((int)lowBatteryOutputLimit + offset, 1, 50)); break;
+    default: snprintf(value, valueSize, "SELECT"); break;
   }
 }
 
@@ -669,6 +850,8 @@ void adjustSettingValue(int direction) {
     case SET_SHOW_POWER: showPowerWatt = !showPowerWatt; break;
     case SET_SHOW_TEMPERATURE: showTemperature = !showTemperature; break;
     case SET_SHOW_FAN: showFanStatus = !showFanStatus; break;
+    case SET_INVERT_LED_PWM: invertLedPWM = !invertLedPWM; break;
+    case SET_INVERT_FAN_PWM: invertFanPWM = !invertFanPWM; break;
     case SET_FADE_IN_ENABLE: fadeEnabled = !fadeEnabled; break;
     case SET_FADE_OUT_ENABLE: fadeOutEnabled = !fadeOutEnabled; break;
     case SET_DISPLAY_MODE: displayMode = (displayMode + (direction > 0 ? 1 : 2)) % 3; oledIdleSince = millis(); if (displayMode == 0 || (displayMode == 1 && ledOn) || displayMode == 2) {
@@ -684,6 +867,10 @@ void adjustSettingValue(int direction) {
       oledIdleSince = millis();
       break;
     case SET_OLED_BRIGHTNESS: oledBrightness = (uint8_t)constrain((int)oledBrightness + direction * 5, 1, 100); applyOLEDSettings(); break;
+    case SET_SCREEN_SAVER:
+      screenSaverStyle = (screenSaverStyle + (direction > 0 ? 1 : 5)) % 6;
+      if (screenSaverStyle == 5) rollingScreenSaverStyle = 0;
+      break;
     case SET_PWM_FREQUENCY: {
         uint8_t previousFrequency = pwmFrequencyKHz;
         pwmFrequencyKHz = (uint8_t)constrain((int)pwmFrequencyKHz + direction, PWM_FREQUENCY_MIN_KHZ, PWM_FREQUENCY_MAX_KHZ);
@@ -710,14 +897,28 @@ void adjustSettingValue(int direction) {
     case SET_LED_TEMP_LIMIT: ledTempLimit = constrain(ledTempLimit + direction, 65.0, 82.0); break;
     case SET_TURBO_FAN_MODE: turboFanBoostEnabled = !turboFanBoostEnabled; break;
     case SET_TURBO_FAN_START: turboFanStartSpeed = (uint8_t)constrain((int)turboFanStartSpeed + direction * 5, 0, 100); break;
-    case SET_BATTERY_CAL: batteryCalOffset = round(constrain(batteryCalOffset + 0.10 * direction, -8.00, 2.00) * 100.0) / 100.0; lastBatteryRead = 0; break;
-    case SET_LOW_BATT_WARNING: lowBatteryWarningVoltage = constrain(lowBatteryWarningVoltage + 0.1 * direction, 10.0, 12.0); break;
+    case SET_BATTERY_CAL: {
+        float previousOffset = batteryCalOffset;
+        batteryCalOffset = round(constrain(batteryCalOffset + 0.01 * direction, -8.00, 2.00) * 100.0) / 100.0;
+        if (batteryCalOffset != previousOffset) {
+          batteryCalibrationDirty = true;
+          if (filteredBatteryVoltage >= 0.0f) {
+            batteryVoltage = max(0.0f, filteredBatteryVoltage + batteryCalOffset);
+            batteryDisplayVoltage = batteryVoltage;
+          }
+        }
+        break;
+      }
+    case SET_BATTERY_CHEMISTRY:
+      batteryChemistry = (BatteryChemistry)((batteryChemistry + (direction > 0 ? 1 : 2)) % 3);
+      break;
+    case SET_BATTERY_SERIES:
+      batterySeriesCount = (uint8_t)constrain((int)batterySeriesCount + direction, 1, 4);
+      break;
     case SET_LOW_BATT_LIMIT: lowBatteryOutputLimit = (uint8_t)constrain((int)lowBatteryOutputLimit + direction, 1, 50); break;
-    case SET_CRITICAL_VOLTAGE: criticalBatteryVoltage = constrain(criticalBatteryVoltage + 0.1 * direction, 8.5, 9.6); if (recoveryBatteryVoltage <= criticalBatteryVoltage) recoveryBatteryVoltage = criticalBatteryVoltage + 0.5; break;
-    case SET_RECOVERY_VOLTAGE: recoveryBatteryVoltage = constrain(recoveryBatteryVoltage + 0.1 * direction, criticalBatteryVoltage + 0.5, 12.0); break;
     default: return;
   }
-  if (id != SET_PWM_FREQUENCY) saveSettingConfig();
+  if (id != SET_PWM_FREQUENCY && id != SET_BATTERY_CAL) saveSettingConfig();
 }
 
 void handleSettingMenu() {
@@ -736,6 +937,7 @@ void handleSettingMenu() {
   }
   if (settingMainStable == LOW && !settingMainLongDone && now - settingMainPressAt >= SETTING_HOLD_TIME) {
     settingMainLongDone = true;
+    if (batteryCalibrationDirty) saveSettingConfig();
     settingMode = false;
     settingEditing = false;
     settingResetConfirm = false;
@@ -761,6 +963,9 @@ void handleSettingMenu() {
       settingResetConfirm = false;  // cancel confirmation
       settingResetChoice = 0;
     } else if (settingEditing) {
+      if (getCurrentSettingId() == SET_BATTERY_CAL && batteryCalibrationDirty) {
+        saveSettingConfig();
+      }
       settingEditing = false;       // value editor -> item list
       settingEditField = 0;
     } else if (settingPage == 1) {
@@ -784,6 +989,9 @@ void handleSettingMenu() {
       if (getCurrentSettingId() == SET_DISPLAY_TIMEOUT) {
         settingEditField = (settingEditField + 1) % 2;
       } else {
+        if (getCurrentSettingId() == SET_BATTERY_CAL && batteryCalibrationDirty) {
+          saveSettingConfig();
+        }
         settingEditing = false;
         settingEditField = 0;
       }
@@ -795,10 +1003,13 @@ void handleSettingMenu() {
       if (id == SET_RESET_DEFAULTS) {
         settingResetConfirm = true;
         settingResetChoice = 0;
+      } else if (isCheckboxSetting(id)) {
+        adjustSettingValue(+1);
       } else {
-        settingMenuIndex = id;
         settingEditing = true;
         settingEditField = 0;
+        settingValueScrollPosition = 0.0f;
+        settingValueScrollUpdatedAt = now;
       }
     }
   }
@@ -807,39 +1018,71 @@ void handleSettingMenu() {
     settingMainBackDone = false;
   }
 
+  bool plusStep = plusPressed;
+  bool minusStep = minusPressed;
+  if (plusPressed) {
+    settingPlusRepeatAt = now + SETTING_VALUE_REPEAT_DELAY;
+  } else if (settingPlusStable == LOW && (int32_t)(now - settingPlusRepeatAt) >= 0) {
+    plusStep = true;
+    settingPlusRepeatAt = now + SETTING_VALUE_REPEAT_INTERVAL;
+  }
+  if (minusPressed) {
+    settingMinusRepeatAt = now + SETTING_VALUE_REPEAT_DELAY;
+  } else if (settingMinusStable == LOW && (int32_t)(now - settingMinusRepeatAt) >= 0) {
+    minusStep = true;
+    settingMinusRepeatAt = now + SETTING_VALUE_REPEAT_INTERVAL;
+  }
+
   if (settingResetConfirm) {
-    if (plusPressed && !minusPressed) settingResetChoice = 1;
-    if (minusPressed && !plusPressed) settingResetChoice = 0;
+    if (plusStep && !minusStep) settingResetChoice = 1;
+    if (minusStep && !plusStep) settingResetChoice = 0;
   } else if (settingEditing) {
-    if (getCurrentSettingId() == SET_PWM_FREQUENCY) {
-      if (plusPressed && !minusPressed) {
+    if (plusStep && !minusStep) {
+      if (getCurrentSettingId() == SET_BATTERY_CAL) {
         adjustSettingValue(+1);
-        settingPlusRepeatAt = now + SETTING_VALUE_REPEAT_DELAY;
-      } else if (minusPressed && !plusPressed) {
-        adjustSettingValue(-1);
-        settingMinusRepeatAt = now + SETTING_VALUE_REPEAT_DELAY;
-      } else if (settingPlusStable == LOW && settingMinusStable != LOW && (int32_t)(now - settingPlusRepeatAt) >= 0) {
+      } else {
+        char previousValue[20];
+        formatSettingOption(getCurrentSettingId(), 0, previousValue, sizeof(previousValue));
         adjustSettingValue(+1);
-        settingPlusRepeatAt = now + SETTING_VALUE_REPEAT_INTERVAL;
-      } else if (settingMinusStable == LOW && settingPlusStable != LOW && (int32_t)(now - settingMinusRepeatAt) >= 0) {
-        adjustSettingValue(-1);
-        settingMinusRepeatAt = now + SETTING_VALUE_REPEAT_INTERVAL;
+        char currentValue[20];
+        char nextValue[20];
+        formatSettingOption(getCurrentSettingId(), 0, currentValue, sizeof(currentValue));
+        formatSettingOption(getCurrentSettingId(), 1, nextValue, sizeof(nextValue));
+        settingValueScrollPosition = strcmp(previousValue, currentValue) == 0 ||
+                                     strcmp(nextValue, currentValue) == 0
+                                       ? 0.0f
+                                       : -1.0f;
+        settingValueScrollUpdatedAt = now;
       }
-    } else {
-      if (plusPressed) adjustSettingValue(+1);
-      if (minusPressed) adjustSettingValue(-1);
+    }
+    if (minusStep && !plusStep) {
+      if (getCurrentSettingId() == SET_BATTERY_CAL) {
+        adjustSettingValue(-1);
+      } else {
+        char previousValue[20];
+        formatSettingOption(getCurrentSettingId(), 0, previousValue, sizeof(previousValue));
+        adjustSettingValue(-1);
+        char currentValue[20];
+        char previousOption[20];
+        formatSettingOption(getCurrentSettingId(), 0, currentValue, sizeof(currentValue));
+        formatSettingOption(getCurrentSettingId(), -1, previousOption, sizeof(previousOption));
+        settingValueScrollPosition = strcmp(previousValue, currentValue) == 0 ||
+                                     strcmp(previousOption, currentValue) == 0
+                                       ? 0.0f
+                                       : 1.0f;
+        settingValueScrollUpdatedAt = now;
+      }
     }
   } else if (settingPage == 0) {
-    if (plusPressed && !minusPressed) settingCategoryIndex = (settingCategoryIndex + 1) % SETTING_CATEGORY_COUNT;
-    if (minusPressed && !plusPressed) settingCategoryIndex = (settingCategoryIndex + SETTING_CATEGORY_COUNT - 1) % SETTING_CATEGORY_COUNT;
+    if (plusStep && !minusStep) settingCategoryIndex = (settingCategoryIndex + 1) % SETTING_CATEGORY_COUNT;
+    if (minusStep && !plusStep) settingCategoryIndex = (settingCategoryIndex + SETTING_CATEGORY_COUNT - 1) % SETTING_CATEGORY_COUNT;
   } else {
-    if (plusPressed && minusPressed) {
+    if (plusStep && minusStep) {
       settingPage = 0;
     } else {
       uint8_t count = settingCategoryItemCounts[settingCategoryIndex];
-      if (plusPressed) settingSubmenuIndex = (settingSubmenuIndex + 1) % count;
-      if (minusPressed) settingSubmenuIndex = (settingSubmenuIndex + count - 1) % count;
-      settingMenuIndex = getCurrentSettingId();
+      if (plusStep) settingSubmenuIndex = (settingSubmenuIndex + 1) % count;
+      if (minusStep) settingSubmenuIndex = (settingSubmenuIndex + count - 1) % count;
     }
   }
   if (pwmFrequencyDirty && settingPlusStable != LOW && settingMinusStable != LOW) {
@@ -855,7 +1098,10 @@ void saveSettingConfig() {
   uint8_t temperatureValue = showTemperature ? 1 : 0;
   uint8_t fanValue = showFanStatus ? 1 : 0;
   uint8_t pwmValue = showPWM ? 1 : 0;
+  uint8_t invertLedPWMValue = invertLedPWM ? 1 : 0;
+  uint8_t invertFanPWMValue = invertFanPWM ? 1 : 0;
   uint8_t timeoutUnitValue = displayTimeoutInMinutes ? 1 : 0;
+  uint8_t batteryChemistryValue = (uint8_t)batteryChemistry;
   EEPROM.put(EEPROM_FAN_LIMIT_ADDR, fanTempLimit);
   EEPROM.put(EEPROM_BATTERY_CAL_ADDR, batteryCalOffset);
   EEPROM.put(EEPROM_FADE_ENABLED_ADDR, fadeValue);
@@ -880,18 +1126,21 @@ void saveSettingConfig() {
   EEPROM.put(EEPROM_FAN_MIN_SPEED_ADDR, fanMinSpeed);
   EEPROM.put(EEPROM_SHOW_PWM_ADDR, pwmValue);
   EEPROM.put(EEPROM_DISPLAY_MODE_ADDR, displayMode);
+  EEPROM.put(EEPROM_SCREEN_SAVER_ADDR, screenSaverStyle);
   EEPROM.put(EEPROM_FAN_START_TEMP_ADDR, fanStartTemp);
   EEPROM.put(EEPROM_FAN_STOP_TEMP_ADDR, fanStopTemp);
   EEPROM.put(EEPROM_FAN_MAX_SPEED_ADDR, fanMaxSpeed);
   EEPROM.put(EEPROM_LED_TEMP_LIMIT_ADDR, ledTempLimit);
-  EEPROM.put(EEPROM_LOW_BATT_WARN_ADDR, lowBatteryWarningVoltage);
   EEPROM.put(EEPROM_LOW_BATT_LIMIT_ADDR, lowBatteryOutputLimit);
-  EEPROM.put(EEPROM_CRITICAL_VOLT_ADDR, criticalBatteryVoltage);
-  EEPROM.put(EEPROM_RECOVERY_VOLT_ADDR, recoveryBatteryVoltage);
+  EEPROM.put(EEPROM_BATTERY_CHEMISTRY_ADDR, batteryChemistryValue);
+  EEPROM.put(EEPROM_BATTERY_SERIES_ADDR, batterySeriesCount);
   EEPROM.put(EEPROM_PWM_FREQUENCY_ADDR, pwmFrequencyKHz);
   EEPROM.put(EEPROM_TURBO_FAN_MODE_ADDR, (uint8_t)(turboFanBoostEnabled ? 1 : 0));
   EEPROM.put(EEPROM_TURBO_FAN_START_ADDR, turboFanStartSpeed);
+  EEPROM.put(EEPROM_INVERT_LED_PWM_ADDR, invertLedPWMValue);
+  EEPROM.put(EEPROM_INVERT_FAN_PWM_ADDR, invertFanPWMValue);
   EEPROM.commit();
+  batteryCalibrationDirty = false;
   applyOLEDSettings();
 }
 
@@ -909,6 +1158,8 @@ void resetSettingDefaults() {
   pwmFrequencyKHz = PWM_FREQUENCY_DEFAULT_KHZ;
   applyPWMFrequency();
   pwmFrequencyDirty = false;
+  invertLedPWM = false;
+  invertFanPWM = false;
   fanTempLimit = 70.0;
   batteryCalOffset = 0.0;
   fadeEnabled = true;
@@ -929,12 +1180,13 @@ void resetSettingDefaults() {
   fanStopTemp = 40.0;
   fanTemperatureActive = false;
   ledTempLimit = 75.0;
-  lowBatteryWarningVoltage = 11.0;
   lowBatteryOutputLimit = 15;
-  criticalBatteryVoltage = 9.0;
-  recoveryBatteryVoltage = 10.8;
+  batteryChemistry = BATTERY_POLYMER;
+  batterySeriesCount = 3;
   showPWM = true;
   displayMode = 2;
+  screenSaverStyle = 1;
+  rollingScreenSaverStyle = 0;
   ledWattCapacity = LED_POWER_DEFAULT;
   oledBrightness = 70;
   displayTimeoutValue = 1;
@@ -952,6 +1204,14 @@ void updateOLEDPowerState() {
   if (settingMode) {
     oledDisplayActive = true;
     if (oledOK) display.ssd1306_command(SSD1306_DISPLAYON);
+    return;
+  }
+  if (mainScreenRequested) {
+    oledIdleSince = now;
+    if (!oledDisplayActive) {
+      oledDisplayActive = true;
+      display.ssd1306_command(SSD1306_DISPLAYON);
+    }
     return;
   }
   if (displayMode == 0) { // ALWAYS ON
@@ -997,9 +1257,7 @@ void updateWarningBlink() {
 void updateBatteryWarningBlink() {
   unsigned long now =
     millis();
-  bool batteryWeak =
-    batteryPresent &&
-    batteryVoltage <= lowBatteryWarningVoltage;
+  bool batteryWeak = isBatteryLow();
   if (!batteryWeak) {
     batteryBlinkState = true;
     lastBatteryBlink = now;
@@ -1223,6 +1481,76 @@ void drawFanIcon(
 }
 
 
+void drawSettingMenuItem(const char *label, int16_t y, bool showCheckbox, bool checked) {
+  const uint8_t maxCharacters = showCheckbox ? 8 : 10;
+  const uint8_t maxLines = 3;
+  char lines[3][11] = {};
+  uint8_t lineCount = 1;
+  uint8_t lineLength = 0;
+  uint8_t labelIndex = 0;
+  while (label[labelIndex] != '\0') {
+    while (label[labelIndex] == ' ') labelIndex++;
+    uint8_t wordStart = labelIndex;
+    while (label[labelIndex] != '\0' && label[labelIndex] != ' ') labelIndex++;
+    uint8_t wordLength = labelIndex - wordStart;
+    if (lineLength > 0 && wordLength + 1 > maxCharacters - lineLength) {
+      lineCount++;
+      lineLength = 0;
+    }
+    if (lineLength > 0) lines[lineCount - 1][lineLength++] = ' ';
+    while (wordLength > 0 && lineCount <= maxLines) {
+      uint8_t remaining = maxCharacters - lineLength;
+      uint8_t copyLength = min(wordLength, remaining);
+      memcpy(lines[lineCount - 1] + lineLength, label + wordStart, copyLength);
+      lineLength += copyLength;
+      wordStart += copyLength;
+      wordLength -= copyLength;
+      if (wordLength > 0) {
+        lineCount++;
+        lineLength = 0;
+      }
+    }
+    if (lineCount > maxLines) break;
+  }
+
+  int16_t textWidth = showCheckbox ? 104 : SCREEN_WIDTH;
+  int16_t textY = y + (SCREEN_HEIGHT - 16 - lineCount * 16) / 2;
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  for (uint8_t lineIndex = 0; lineIndex < lineCount; lineIndex++) {
+    int16_t x1, y1;
+    uint16_t textPixelWidth, textPixelHeight;
+    display.getTextBounds(lines[lineIndex], 0, 0, &x1, &y1, &textPixelWidth, &textPixelHeight);
+    display.setCursor((textWidth - textPixelWidth) / 2, textY + lineIndex * 16);
+    display.print(lines[lineIndex]);
+  }
+  if (showCheckbox) {
+    const int16_t checkboxX = 112;
+    const int16_t checkboxY = y + (SCREEN_HEIGHT - 16 - 12) / 2;
+    display.drawRect(checkboxX, checkboxY, 12, 12, SSD1306_WHITE);
+    if (checked) {
+      display.drawLine(checkboxX + 2, checkboxY + 5, checkboxX + 5, checkboxY + 9, SSD1306_WHITE);
+      display.drawLine(checkboxX + 5, checkboxY + 9, checkboxX + 10, checkboxY + 2, SSD1306_WHITE);
+    }
+  }
+}
+
+void drawSettingsHeader() {
+  uint8_t *buffer = display.getBuffer();
+  if (buffer) {
+    memset(buffer, 0, SCREEN_WIDTH * 2);
+  }
+
+  const char *title = "SETTINGS";
+  int16_t x1, y1;
+  uint16_t titleWidth, titleHeight;
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.getTextBounds(title, 0, 0, &x1, &y1, &titleWidth, &titleHeight);
+  display.setCursor((SCREEN_WIDTH - titleWidth) / 2, (16 - titleHeight) / 2);
+  display.print(title);
+}
+
 void tampilkanOLED() {
 
   if (!oledOK) {
@@ -1236,194 +1564,144 @@ void tampilkanOLED() {
     }
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
-    display.setTextSize(1);
-    // Yellow OLED band (top 16 px): title only. Blue area: menu/content.
-    const char *title = settingResetConfirm ? "CONFIRM RESET" : (settingEditing ? "EDIT SETTING" : (settingPage == 0 ? "SETTINGS" : settingCategoryLabels[settingCategoryIndex]));
-    int16_t x1, y1; uint16_t tw, th;
-    display.getTextBounds(title, 0, 0, &x1, &y1, &tw, &th);
-    display.setCursor((128 - tw) / 2, 4);
-    display.print(title);
-    display.drawLine(0, 15, 127, 15, SSD1306_WHITE);
 
     if (settingResetConfirm) {
-      display.setTextSize(1);
-      display.setCursor(8, 23);
-      display.print("Reset all settings?");
-      display.setCursor(8, 35);
-      display.print("Defaults will load");
-      display.setTextSize(1);
-      display.fillRect(2, 49, 60, 12, settingResetChoice == 0 ? SSD1306_WHITE : SSD1306_BLACK);
-      display.setTextColor(settingResetChoice == 0 ? SSD1306_BLACK : SSD1306_WHITE);
-      display.setCursor(15, 51);
-      display.print("CANCEL");
-      display.fillRect(66, 49, 60, 12, settingResetChoice == 1 ? SSD1306_WHITE : SSD1306_BLACK);
-      display.setTextColor(settingResetChoice == 1 ? SSD1306_BLACK : SSD1306_WHITE);
-      display.setCursor(78, 51);
-      display.print("RESET");
-      display.setTextColor(SSD1306_WHITE);
+      display.setTextSize(2);
+      display.setCursor(8, 24);
+      display.print(settingResetChoice == 0 ? ">CANCEL" : "CANCEL");
+      display.setCursor(8, 44);
+      display.print(settingResetChoice == 1 ? ">RESET" : "RESET");
     } else if (settingEditing) {
       uint8_t id = getCurrentSettingId();
-      display.setTextSize(1);
-      display.setCursor(0, 19);
-      display.print(getSettingLabel(id));
       if (id == SET_BATTERY_CAL) {
-        // Tampilkan tegangan baterai realtime yang sudah termasuk offset kalibrasi.
-        char voltageText[12];
-        if (batteryPresent) snprintf(voltageText, sizeof(voltageText), "%.1fV", batteryDisplayVoltage >= 0.0 ? batteryDisplayVoltage : batteryVoltage);
-        else snprintf(voltageText, sizeof(voltageText), "--.-V");
-        int16_t vx, vy; uint16_t vw, vh;
-        display.getTextBounds(voltageText, 0, 0, &vx, &vy, &vw, &vh);
-        display.setCursor(126 - vw, 19);
-        display.print(voltageText);
-        display.setTextSize(2);
-        display.setCursor(0, 34);
+        char rawVoltage[16];
+        char adjustedVoltage[16];
+        if (batteryPresent && filteredBatteryVoltage >= 0.0f) {
+          snprintf(rawVoltage, sizeof(rawVoltage), "%.2fV", filteredBatteryVoltage);
+          snprintf(adjustedVoltage, sizeof(adjustedVoltage), "%.2fV", batteryVoltage);
+        } else {
+          snprintf(rawVoltage, sizeof(rawVoltage), "--.--V");
+          snprintf(adjustedVoltage, sizeof(adjustedVoltage), "--.--V");
+        }
+
+        display.setTextSize(1);
+        display.setCursor(17, 20);
+        display.print("RAW");
+        display.setCursor(78, 20);
+        display.print("ADJUSTED");
+
+        int16_t x1, y1;
+        uint16_t textWidth, textHeight;
+        display.getTextBounds(rawVoltage, 0, 0, &x1, &y1, &textWidth, &textHeight);
+        display.setCursor((64 - textWidth) / 2, 32);
+        display.print(rawVoltage);
+        display.getTextBounds(adjustedVoltage, 0, 0, &x1, &y1, &textWidth, &textHeight);
+        display.setCursor(64 + (64 - textWidth) / 2, 32);
+        display.print(adjustedVoltage);
+
+        display.setCursor(31, 53);
+        display.print("+/- ADJUST");
       } else {
-        display.setTextSize(2);
-        display.setCursor(0, 31);
-      }
-      switch (id) {
-        case SET_SHOW_PWM: display.print(showPWM ? "ON" : "OFF"); break;
-        case SET_SHOW_VOLTAGE: display.print(showVoltage ? "ON" : "OFF"); break;
-        case SET_SHOW_BATTERY_PERCENT: display.print(showBatteryPercent ? "ON" : "OFF"); break;
-        case SET_SHOW_POWER: display.print(showPowerWatt ? "ON" : "OFF"); break;
-        case SET_SHOW_TEMPERATURE: display.print(showTemperature ? "ON" : "OFF"); break;
-        case SET_SHOW_FAN: display.print(showFanStatus ? "ON" : "OFF"); break;
-        case SET_DISPLAY_MODE: display.print(displayMode == 0 ? "ALWAYS" : displayMode == 1 ? "AUTO LED" : "TIMEOUT"); break;
-        case SET_PWM_FREQUENCY: display.print(pwmFrequencyKHz); display.print(" kHz"); break;
-        case SET_FAN_START_TEMP: display.print(fanStartTemp, 0); display.print(" C"); break;
-        case SET_FAN_STOP_TEMP: display.print(fanStopTemp, 0); display.print(" C"); break;
-        case SET_FAN_MAX_SPEED: display.print(fanMaxSpeed); display.print(" %"); break;
-        case SET_LED_TEMP_LIMIT: display.print(ledTempLimit, 0); display.print(" C"); break;
-        case SET_TURBO_FAN_MODE: display.print(turboFanBoostEnabled ? "BOOST" : "AUTO"); break;
-        case SET_TURBO_FAN_START: display.print(turboFanStartSpeed); display.print(" %"); break;
-        case SET_LOW_BATT_WARNING: display.print(lowBatteryWarningVoltage, 1); display.print(" V"); break;
-        case SET_LOW_BATT_LIMIT: display.print(lowBatteryOutputLimit); display.print(" %"); break;
-        case SET_CRITICAL_VOLTAGE: display.print(criticalBatteryVoltage, 1); display.print(" V"); break;
-        case SET_RECOVERY_VOLTAGE: display.print(recoveryBatteryVoltage, 1); display.print(" V"); break;
-        case SET_STROBE_SPEED: display.print(strobeSpeedHz); display.print(" Hz"); break;
-        case SET_FADE_IN_ENABLE: display.print(fadeEnabled ? "ON" : "OFF"); break;
-        case SET_FADE_OUT_ENABLE: display.print(fadeOutEnabled ? "ON" : "OFF"); break;
-        case SET_FADE_IN_TIME: display.print(fadeDurationSec); display.print(" sec"); break;
-        case SET_FADE_OUT_TIME: display.print(fadeOutDurationSec); display.print(" sec"); break;
-        case SET_LED_WATT: display.print(ledWattCapacity, 0); display.print(" W"); break;
-        case SET_LOW_OUTPUT: display.print(lowOutputLimit, 0); display.print(" %"); break;
-        case SET_MED_OUTPUT: display.print(mediumOutputLimit, 0); display.print(" %"); break;
-        case SET_HIGH_OUTPUT: display.print(highOutputLimit, 0); display.print(" %"); break;
-        case SET_TURBO_OUTPUT: display.print(turboOutputLimit, 0); display.print(" %"); break;
-        case SET_TURBO_TIMEOUT: if (turboTimeoutSec == 0) display.print("OFF"); else {
-            display.print(turboTimeoutSec);
-            display.print(" s");
-          } break;
-        case SET_FAN_TEMP_LIMIT: display.print(fanTempLimit, 0); display.print(" C"); break;
-        case SET_FAN_MIN_SPEED: display.print(fanMinSpeed); display.print(" %"); break;
-        case SET_BATTERY_CAL: if (batteryCalOffset >= 0) display.print("+"); display.print(batteryCalOffset, 1); display.print("V"); break;
-        case SET_OLED_BRIGHTNESS: display.print(oledBrightness); display.print("%"); break;
-        case SET_DISPLAY_TIMEOUT: {
-            bool valueSelected = settingEditField == 0;
-            display.fillRect(0, 30, 40, 21, valueSelected ? SSD1306_WHITE : SSD1306_BLACK);
-            display.setTextColor(valueSelected ? SSD1306_BLACK : SSD1306_WHITE);
-            display.setCursor(3, 32);
-            display.print(displayTimeoutValue);
-            bool unitSelected = settingEditField == 1;
-            display.fillRect(45, 30, 83, 21, unitSelected ? SSD1306_WHITE : SSD1306_BLACK);
-            display.setTextColor(unitSelected ? SSD1306_BLACK : SSD1306_WHITE);
-            display.setCursor(49, 32);
-            display.print(displayTimeoutInMinutes ? "MENIT" : "DETIK");
-            display.setTextColor(SSD1306_WHITE);
-            display.setTextSize(1);
-            display.setCursor(0, 54);
-            display.print("MAIN:NEXT HOLD:BACK");
-            display.setTextSize(2);
-            break;
+        unsigned long now = millis();
+        float distance = -settingValueScrollPosition;
+        float maxStep = (now - settingValueScrollUpdatedAt) * 0.01f;
+        if (maxStep > distance && distance > 0.0f) maxStep = distance;
+        if (maxStep > -distance && distance < 0.0f) maxStep = -distance;
+        settingValueScrollPosition += distance > 0.0f ? maxStep : distance < 0.0f ? -maxStep : 0.0f;
+        settingValueScrollUpdatedAt = now;
+        for (int8_t optionOffset = -1; optionOffset <= 1; optionOffset++) {
+          int16_t y = (int16_t)(32 + (optionOffset - settingValueScrollPosition) * 16);
+          if (y < 16 || y > SCREEN_HEIGHT - 16) continue;
+          char value[20];
+          char currentValue[20];
+          formatSettingOption(id, optionOffset, value, sizeof(value));
+          formatSettingOption(id, 0, currentValue, sizeof(currentValue));
+          if (optionOffset != 0 && strcmp(value, currentValue) == 0) continue;
+          bool duplicate = false;
+          if (optionOffset != 0) {
+            for (int8_t previousOffset = -1; previousOffset < optionOffset; previousOffset++) {
+              int16_t previousY = (int16_t)(32 + (previousOffset - settingValueScrollPosition) * 16);
+              if (previousY < 16 || previousY > SCREEN_HEIGHT - 16) continue;
+              char previousValue[20];
+              formatSettingOption(id, previousOffset, previousValue, sizeof(previousValue));
+              if (strcmp(value, previousValue) == 0) {
+                duplicate = true;
+                break;
+              }
+            }
           }
-        case SET_RESET_DEFAULTS: display.print("RESET?"); break;
-      }
-    } else if (settingPage == 0) {
-      const uint8_t visible = 5;
-      uint8_t first = settingCategoryIndex >= visible ? settingCategoryIndex - visible + 1 : 0;
-      uint8_t maxFirst = SETTING_CATEGORY_COUNT > visible ? SETTING_CATEGORY_COUNT - visible : 0;
-      if (first > maxFirst) first = maxFirst;
-      for (uint8_t row = 0; row < visible; row++) {
-        uint8_t i = first + row;
-        if (i >= SETTING_CATEGORY_COUNT) break;
-        int16_t y = 18 + row * 9;
-        bool selected = i == settingCategoryIndex;
-        if (selected) {
-          display.fillRect(0, y, 128, 9, SSD1306_WHITE);
-          display.setTextColor(SSD1306_BLACK);
+          if (duplicate) continue;
+          char displayValue[22];
+          snprintf(displayValue, sizeof(displayValue), optionOffset == 0 ? ">%s" : "%s", value);
+          int16_t x1, y1;
+          uint16_t valueWidth, valueHeight;
+          display.setTextSize(2);
+          display.getTextBounds(displayValue, 0, 0, &x1, &y1, &valueWidth, &valueHeight);
+          display.setCursor((SCREEN_WIDTH - valueWidth) / 2, y);
+          display.print(displayValue);
         }
-        else display.setTextColor(SSD1306_WHITE);
-        display.setCursor(2, y);
-        display.print(selected ? "> " : "  ");
-        display.print(settingCategoryLabels[i]);
       }
-      display.setTextColor(SSD1306_WHITE);
     } else {
-      uint8_t count = settingCategoryItemCounts[settingCategoryIndex];
-      const uint8_t visible = 5;
-      uint8_t first = settingSubmenuIndex >= visible ? settingSubmenuIndex - visible + 1 : 0;
-      uint8_t maxFirst = count > visible ? count - visible : 0;
-      if (first > maxFirst) first = maxFirst;
-      for (uint8_t row = 0; row < visible; row++) {
-        uint8_t idx = first + row;
-        if (idx >= count) break;
-        uint8_t id = settingCategoryItems[settingCategoryIndex][idx];
-        int16_t y = 18 + row * 8;
-        bool selected = idx == settingSubmenuIndex;
-        if (selected) {
-          display.fillRect(0, y, 128, 8, SSD1306_WHITE);
-          display.setTextColor(SSD1306_BLACK);
-        }
-        else display.setTextColor(SSD1306_WHITE);
-        display.setCursor(2, y);
-        display.print(selected ? ">" : " ");
-        display.print(getSettingLabel(id));
-        display.setCursor(96, y);
-        switch (id) {
-          case SET_SHOW_PWM: display.print(showPWM ? "ON" : "OFF"); break;
-          case SET_SHOW_VOLTAGE: display.print(showVoltage ? "ON" : "OFF"); break;
-          case SET_SHOW_BATTERY_PERCENT: display.print(showBatteryPercent ? "ON" : "OFF"); break;
-          case SET_SHOW_POWER: display.print(showPowerWatt ? "ON" : "OFF"); break;
-          case SET_SHOW_TEMPERATURE: display.print(showTemperature ? "ON" : "OFF"); break;
-          case SET_SHOW_FAN: display.print(showFanStatus ? "ON" : "OFF"); break;
-          case SET_DISPLAY_MODE: display.print(displayMode == 0 ? "ALWAYS" : displayMode == 1 ? "AUTO" : "TIMEOUT"); break;
-          case SET_PWM_FREQUENCY: display.print(pwmFrequencyKHz); display.print("kHz"); break;
-          case SET_FAN_START_TEMP: display.print(fanStartTemp, 0); display.print("C"); break;
-          case SET_FAN_STOP_TEMP: display.print(fanStopTemp, 0); display.print("C"); break;
-          case SET_FAN_MAX_SPEED: display.print(fanMaxSpeed); display.print("%"); break;
-          case SET_LED_TEMP_LIMIT: display.print(ledTempLimit, 0); display.print("C"); break;
-          case SET_TURBO_FAN_MODE: display.print(turboFanBoostEnabled ? "BOOST" : "AUTO"); break;
-          case SET_TURBO_FAN_START: display.print(turboFanStartSpeed); display.print("%"); break;
-          case SET_LOW_BATT_WARNING: display.print(lowBatteryWarningVoltage, 1); break;
-          case SET_LOW_BATT_LIMIT: display.print(lowBatteryOutputLimit); display.print("%"); break;
-          case SET_CRITICAL_VOLTAGE: display.print(criticalBatteryVoltage, 1); break;
-          case SET_RECOVERY_VOLTAGE: display.print(recoveryBatteryVoltage, 1); break;
-          case SET_STROBE_SPEED: display.print(strobeSpeedHz); display.print("Hz"); break;
-          case SET_FADE_IN_ENABLE: display.print(fadeEnabled ? "ON" : "OFF"); break;
-          case SET_FADE_OUT_ENABLE: display.print(fadeOutEnabled ? "ON" : "OFF"); break;
-          case SET_FADE_IN_TIME: display.print(fadeDurationSec); display.print("s"); break;
-          case SET_FADE_OUT_TIME: display.print(fadeOutDurationSec); display.print("s"); break;
-          case SET_LED_WATT: display.print(ledWattCapacity, 0); display.print("W"); break;
-          case SET_LOW_OUTPUT: display.print(lowOutputLimit, 0); display.print("%"); break;
-          case SET_MED_OUTPUT: display.print(mediumOutputLimit, 0); display.print("%"); break;
-          case SET_HIGH_OUTPUT: display.print(highOutputLimit, 0); display.print("%"); break;
-          case SET_TURBO_OUTPUT: display.print(turboOutputLimit, 0); display.print("%"); break;
-          case SET_TURBO_TIMEOUT: if (turboTimeoutSec == 0) display.print("OFF"); else {
-              display.print(turboTimeoutSec);
-              display.print("s");
-            } break;
-          case SET_FAN_TEMP_LIMIT: display.print(fanTempLimit, 0); display.print("C"); break;
-          case SET_FAN_MIN_SPEED: display.print(fanMinSpeed); display.print("%"); break;
-          case SET_BATTERY_CAL: if (batteryCalOffset >= 0) display.print("+"); display.print(batteryCalOffset, 1); break;
-          case SET_OLED_BRIGHTNESS: display.print(oledBrightness); display.print("%"); break;
-          case SET_DISPLAY_TIMEOUT: display.print(displayTimeoutValue); display.print(displayTimeoutInMinutes ? "m" : "s"); break;
-          default: break;
+      uint8_t count = settingPage == 0
+                        ? SETTING_CATEGORY_COUNT
+                        : settingCategoryItemCounts[settingCategoryIndex];
+      uint8_t selectedIndex = settingPage == 0
+                                ? settingCategoryIndex
+                                : settingSubmenuIndex;
+      unsigned long now = millis();
+
+      if (settingScrollPage != settingPage ||
+          (settingPage == 1 && settingScrollCategory != settingCategoryIndex)) {
+        settingScrollPosition = selectedIndex;
+        settingScrollPage = settingPage;
+        settingScrollCategory = settingCategoryIndex;
+      } else {
+        unsigned long elapsed = now - settingScrollUpdatedAt;
+        float maxStep = elapsed * 0.006f;
+        float distance = (float)selectedIndex - settingScrollPosition;
+        if (maxStep > distance && distance > 0.0f) maxStep = distance;
+        if (maxStep > -distance && distance < 0.0f) maxStep = -distance;
+        settingScrollPosition += distance > 0.0f ? maxStep : distance < 0.0f ? -maxStep : 0.0f;
+      }
+      settingScrollUpdatedAt = now;
+
+      int16_t firstIndex = (int16_t)settingScrollPosition;
+      for (int8_t offset = -1; offset <= 1; offset++) {
+        int16_t index = firstIndex + offset;
+        if (index < 0 || index >= count) continue;
+        int16_t y = (int16_t)(16 + (index - settingScrollPosition) * (SCREEN_HEIGHT - 16));
+        if (y <= 16 - (SCREEN_HEIGHT - 16) || y >= SCREEN_HEIGHT) continue;
+        if (settingPage == 0) {
+          drawSettingMenuItem(settingCategoryLabels[index], y, false, false);
+        } else {
+          uint8_t id = settingCategoryItems[settingCategoryIndex][index];
+          drawSettingMenuItem(
+            getSettingLabel(id),
+            y,
+            isCheckboxSetting(id),
+            isCheckboxSettingEnabled(id)
+          );
         }
       }
-      display.setTextColor(SSD1306_WHITE);
     }
+
+    drawSettingsHeader();
     display.display();
     return;
+  }
+
+  if (lowBatteryAlertActive) {
+    if (millis() - lowBatteryAlertStartedAt >= LOW_BATTERY_ALERT_DURATION) {
+      lowBatteryAlertActive = false;
+    } else {
+      if (!oledDisplayActive) {
+        oledDisplayActive = true;
+        display.ssd1306_command(SSD1306_DISPLAYON);
+      }
+      drawLowBatteryAlert();
+      display.display();
+      return;
+    }
   }
 
   updateOLEDPowerState();
@@ -1433,6 +1711,13 @@ void tampilkanOLED() {
     return;
   }
 
+  if (!ledOn && screenSaverStyle != 0) {
+    if (!mainScreenRequested) {
+      drawScreenSaver();
+      display.display();
+      return;
+    }
+  }
 
   display.clearDisplay();
 
@@ -1617,7 +1902,7 @@ void tampilkanOLED() {
 
   bool batteryWeak =
     batteryPresent &&
-    batteryVoltage <= lowBatteryWarningVoltage;
+    batteryVoltage <= getBatteryWarningVoltage();
 
 
   if (
@@ -1725,7 +2010,7 @@ void tampilkanOLED() {
 
   bool showBatteryWarning =
     batteryPresent &&
-    batteryVoltage <= lowBatteryWarningVoltage;
+    batteryVoltage <= getBatteryWarningVoltage();
 
 
   if (!ledOn) {
@@ -2014,184 +2299,33 @@ void bacaBattery() {
     batteryDisplayVoltage += 0.12 * (batteryVoltage - batteryDisplayVoltage);
   }
 
-  // ==========================================================
-  // BATTERY PERCENT - LiPo 3S
-  //
-  // 12.60V = 100%
-  // 12.40V = 90%
-  // 12.20V = 80%
-  // 12.00V = 70%
-  // 11.80V = 60%
-  // 11.60V = 50%
-  // 11.40V = 40%
-  // 11.20V = 30%
-  // 11.00V = 20%
-  // 10.80V = 10%
-  // 10.50V = 5%
-  // 9.00V  = 0%
-  // ==========================================================
+  static const uint8_t percentageSteps[] = {100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5, 0};
+  static const float lithiumCellSteps[] = {4.20f, 4.10f, 4.00f, 3.90f, 3.80f, 3.70f, 3.60f, 3.50f, 3.40f, 3.30f, 3.20f, 3.00f};
+  static const float lifepo4CellSteps[] = {3.65f, 3.45f, 3.40f, 3.35f, 3.32f, 3.30f, 3.28f, 3.25f, 3.20f, 3.10f, 3.00f, 2.80f};
+  const float *cellSteps = batteryChemistry == BATTERY_LIFEPO4
+                             ? lifepo4CellSteps
+                             : lithiumCellSteps;
+  float cellVoltage = batteryVoltage / batterySeriesCount;
 
-  if (batteryVoltage >= 12.60) {
-
+  if (cellVoltage >= getBatteryCellFullVoltage()) {
     batteryPercent = 100;
-
-  }
-
-  else if (batteryVoltage >= 12.40) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        1240,
-        1260,
-        90,
-        100
-      );
-
-  }
-
-  else if (batteryVoltage >= 12.20) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        1220,
-        1240,
-        80,
-        90
-      );
-
-  }
-
-  else if (batteryVoltage >= 12.00) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        1200,
-        1220,
-        70,
-        80
-      );
-
-  }
-
-  else if (batteryVoltage >= 11.80) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        1180,
-        1200,
-        60,
-        70
-      );
-
-  }
-
-  else if (batteryVoltage >= 11.60) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        1160,
-        1180,
-        50,
-        60
-      );
-
-  }
-
-  else if (batteryVoltage >= 11.40) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        1140,
-        1160,
-        40,
-        50
-      );
-
-  }
-
-  else if (batteryVoltage >= 11.20) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        1120,
-        1140,
-        30,
-        40
-      );
-
-  }
-
-  else if (batteryVoltage >= 11.00) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        1100,
-        1120,
-        20,
-        30
-      );
-
-  }
-
-  else if (batteryVoltage >= 10.80) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        1080,
-        1100,
-        10,
-        20
-      );
-
-  }
-
-  else if (batteryVoltage >= 10.50) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        1050,
-        1080,
-        5,
-        10
-      );
-
-  }
-
-  else if (batteryVoltage >= 9.00) {
-
-    batteryPercent =
-      map(
-        (int)(batteryVoltage * 100),
-        900,
-        1050,
-        0,
-        5
-      );
-
-  }
-
-  else {
-
+  } else if (cellVoltage <= cellSteps[11]) {
     batteryPercent = 0;
+  } else {
+    for (uint8_t i = 0; i < 11; i++) {
+      if (cellVoltage >= cellSteps[i + 1]) {
+        float fraction = (cellVoltage - cellSteps[i + 1]) /
+                         (cellSteps[i] - cellSteps[i + 1]);
+        batteryPercent = (int)round(
+                           percentageSteps[i + 1] +
+                           fraction * (percentageSteps[i] - percentageSteps[i + 1])
+                         );
+        break;
+      }
+    }
   }
 
-
-  batteryPercent =
-    constrain(
-      batteryPercent,
-      0,
-      100
-    );
+  batteryPercent = constrain(batteryPercent, 0, 100);
 }
 
 uint8_t serialChecksum(const char *data, uint8_t length) {
@@ -2301,6 +2435,10 @@ void processNanoResponse() {
   batteryPacketReceived = true;
   batteryRequestPending = false;
   nanoResponseCount++;
+  if (freshBatteryRequired) {
+    freshBatteryRequired = false;
+    nanoWakePending = false;
+  }
 }
 
 void bacaDataBatteryNano() {
@@ -2327,6 +2465,8 @@ void bacaDataBatteryNano() {
 }
 
 void requestNanoBattery() {
+  if (nanoPaused) return;
+
   unsigned long now = millis();
 
   // Jika request sebelumnya belum mendapat balasan,
@@ -2379,6 +2519,70 @@ void requestNanoBattery() {
   Serial.println(checksum);
 }
 
+void sendNanoControl(char command) {
+  uint8_t checksum = serialChecksum(&command, 1);
+  Serial.print(command);
+  Serial.print(',');
+  Serial.println(checksum);
+}
+
+void resetBatterySample() {
+  batteryPacketReceived = false;
+  batteryPresent = false;
+  batteryVoltage = 0.0;
+  filteredBatteryVoltage = -1.0;
+  batteryDisplayVoltage = -1.0;
+  batteryPercent = 0;
+  receivedBatteryMillivolts = 0;
+  lastBatteryRead = millis() - BATTERY_READ_INTERVAL;
+}
+
+void resumeNanoForUser() {
+  if (!nanoPaused) return;
+
+  while (Serial.available() > 0) {
+    Serial.read();
+    nanoRxByteCount++;
+  }
+  batterySerialLength = 0;
+  batterySerialOverflow = false;
+  batteryRequestPending = false;
+  batteryRequestSent = false;
+  resetBatterySample();
+  nanoConnected = false;
+  nanoPaused = false;
+  nanoWakePending = true;
+  freshBatteryRequired = true;
+  nanoWakeStartedAt = millis();
+  oledIdleSince = nanoWakeStartedAt;
+  oledDisplayActive = true;
+  if (oledOK) display.ssd1306_command(SSD1306_DISPLAYON);
+  sendNanoControl('W');
+}
+
+void updateNanoPauseState() {
+  if (nanoPaused ||
+      nanoWakePending ||
+      ledOn ||
+      ledPWM > 0.0f ||
+      fanPWM != 0 ||
+      settingMode ||
+      lowBatteryAlertActive ||
+      oledDisplayActive ||
+      mainStableState != HIGH ||
+      mainClickCount != 0 ||
+      modeMemoryDirty ||
+      strobeSpeedDirty) {
+    return;
+  }
+
+  sendNanoControl('P');
+  nanoPaused = true;
+  nanoConnected = false;
+  batteryRequestPending = false;
+  batteryRequestSent = false;
+}
+
 void updateNanoConnection() {
   nanoConnected = batteryPacketReceived &&
                   millis() - lastBatteryPacketAt <= NANO_CONNECTION_TIMEOUT;
@@ -2386,10 +2590,12 @@ void updateNanoConnection() {
 
 void updateNanoWarningDisplay() {
   if (!oledOK) return;
+  if (nanoWakePending) return;
   unsigned long now = millis();
   bool warningStateChanged = !warningDisplayInitialized ||
                              lastNanoWarningState != nanoConnected;
-  if (!warningStateChanged && (nanoConnected || now - lastNanoDiagnosticDisplayAt < 500UL)) return;
+  if (!warningStateChanged &&
+      (nanoConnected || !oledDisplayActive || now - lastNanoDiagnosticDisplayAt < 500UL)) return;
 
   oledDisplayActive = true;
   display.ssd1306_command(SSD1306_DISPLAYON);
@@ -2665,20 +2871,20 @@ void checkBatteryProtection() {
     outputLEDPWM(0);
     fanPWM = 0;
     lastFanPWMOutput = 0;
-    analogWrite(FAN_PWM_PIN, 0);
+    writeFanPWMOutput(0);
 
     return;
 
   }
 
   // ==========================================================
-  // BATTERY CRITICAL <= 9.00V
+  // BATTERY CRITICAL: chemistry and series-dependent cutoff
   // LED DAN FAN DIPAKSA OFF
   // ==========================================================
 
   if (
     batteryVoltage > 0.0 &&
-    batteryVoltage <= criticalBatteryVoltage
+    batteryVoltage <= getBatteryCriticalVoltage()
   ) {
 
     batteryCritical = true;
@@ -2695,19 +2901,19 @@ void checkBatteryProtection() {
 
     lastFanPWMOutput = 0;
 
-    analogWrite(FAN_PWM_PIN, 0);
+    writeFanPWMOutput(0);
 
     return;
 
   }
 
   // ==========================================================
-  // BATTERY RECOVERY >= 10.80V
+  // BATTERY RECOVERY: chemistry and series-dependent threshold
   // ==========================================================
 
   if (
     batteryCritical &&
-    batteryVoltage >= recoveryBatteryVoltage
+    batteryVoltage >= getBatteryRecoveryVoltage()
   ) {
 
     batteryCritical = false;
@@ -2725,7 +2931,7 @@ void checkBatteryProtection() {
 
     lastFanPWMOutput = 0;
 
-    analogWrite(FAN_PWM_PIN, 0);
+    writeFanPWMOutput(0);
 
   }
 }
@@ -2887,7 +3093,7 @@ void handleMainButton() {
       settingPage = 0;
       settingCategoryIndex = 0;
       settingSubmenuIndex = 0;
-      settingMenuIndex = 0;
+      settingScrollPage = 255;
       // MAIN masih ditahan untuk masuk Settings; anggap tombol sedang ditekan
       // dan abaikan event release ini agar tidak otomatis memilih DISPLAY SETTINGS.
       settingMainRaw = LOW;
@@ -3018,6 +3224,20 @@ void handleMainButton() {
     mainLongHandled =
       false;
 
+    if (!ledOn) {
+      mainScreenRequested = true;
+      oledIdleSince = now;
+      oledDisplayActive = true;
+      if (oledOK) display.ssd1306_command(SSD1306_DISPLAYON);
+    }
+
+    if (nanoPaused) {
+      resumeNanoForUser();
+    }
+    if (!ledOn) {
+      tampilkanOLED();
+    }
+
     return;
   }
 
@@ -3079,7 +3299,7 @@ void kontrolFan() {
 
     lastFanPWMOutput = 0;
 
-    analogWrite(FAN_PWM_PIN, 0);
+    writeFanPWMOutput(0);
 
     return;
 
@@ -3157,7 +3377,7 @@ void kontrolThermal() {
     outputLEDPWM(0);
     fanPWM = 0;
     lastFanPWMOutput = 0;
-    analogWrite(FAN_PWM_PIN, 0);
+    writeFanPWMOutput(0);
     return;
   }
 
@@ -3250,6 +3470,11 @@ void ledOff() {
   captureCurrentModeMemory();
   saveModeMemory();
   saveStrobeSpeed();
+  if (ledOn && screenSaverStyle == 5) {
+    rollingScreenSaverStyle = rollingScreenSaverStyle >= 4
+                                ? 1
+                                : rollingScreenSaverStyle + 1;
+  }
   ledOn = false;
   turboTimeoutApplied = false;
   userLEDTarget = 0.0;
@@ -3402,10 +3627,14 @@ void loadSettingConfig() {
   uint8_t storedTurboTimeout = 30;
   uint8_t storedFanMinSpeed = 30;
   uint8_t storedPWM = 1, storedDisplayMode = 2, storedFanMaxSpeed = 100, storedLowBattLimit = 15;
+  uint8_t storedScreenSaver = 0xFF;
   uint8_t storedPWMFrequency = 0xFF;
   uint8_t storedTurboFanMode = 0xFF;
   uint8_t storedTurboFanStart = 30;
-  float storedFanStartTemp = 45.0, storedFanStopTemp = 40.0, storedLedTempLimit = 75.0, storedLowBattWarning = 11.0, storedCriticalVoltage = 9.0, storedRecoveryVoltage = 10.8;
+  uint8_t storedInvertLedPWM = 0xFF;
+  uint8_t storedInvertFanPWM = 0xFF;
+  float storedFanStartTemp = 45.0, storedFanStopTemp = 40.0, storedLedTempLimit = 75.0;
+  uint8_t storedBatteryChemistry = 0xFF, storedBatterySeries = 0xFF;
 
   EEPROM.get(EEPROM_FAN_LIMIT_ADDR, storedFanLimit);
   EEPROM.get(EEPROM_BATTERY_CAL_ADDR, storedBatteryOffset);
@@ -3430,17 +3659,19 @@ void loadSettingConfig() {
   EEPROM.get(EEPROM_FAN_MIN_SPEED_ADDR, storedFanMinSpeed);
   EEPROM.get(EEPROM_SHOW_PWM_ADDR, storedPWM);
   EEPROM.get(EEPROM_DISPLAY_MODE_ADDR, storedDisplayMode);
+  EEPROM.get(EEPROM_SCREEN_SAVER_ADDR, storedScreenSaver);
   EEPROM.get(EEPROM_FAN_START_TEMP_ADDR, storedFanStartTemp);
   EEPROM.get(EEPROM_FAN_STOP_TEMP_ADDR, storedFanStopTemp);
   EEPROM.get(EEPROM_FAN_MAX_SPEED_ADDR, storedFanMaxSpeed);
   EEPROM.get(EEPROM_LED_TEMP_LIMIT_ADDR, storedLedTempLimit);
-  EEPROM.get(EEPROM_LOW_BATT_WARN_ADDR, storedLowBattWarning);
   EEPROM.get(EEPROM_LOW_BATT_LIMIT_ADDR, storedLowBattLimit);
-  EEPROM.get(EEPROM_CRITICAL_VOLT_ADDR, storedCriticalVoltage);
-  EEPROM.get(EEPROM_RECOVERY_VOLT_ADDR, storedRecoveryVoltage);
+  EEPROM.get(EEPROM_BATTERY_CHEMISTRY_ADDR, storedBatteryChemistry);
+  EEPROM.get(EEPROM_BATTERY_SERIES_ADDR, storedBatterySeries);
   EEPROM.get(EEPROM_PWM_FREQUENCY_ADDR, storedPWMFrequency);
   EEPROM.get(EEPROM_TURBO_FAN_MODE_ADDR, storedTurboFanMode);
   EEPROM.get(EEPROM_TURBO_FAN_START_ADDR, storedTurboFanStart);
+  EEPROM.get(EEPROM_INVERT_LED_PWM_ADDR, storedInvertLedPWM);
+  EEPROM.get(EEPROM_INVERT_FAN_PWM_ADDR, storedInvertFanPWM);
 
   fanTempLimit = (isfinite(storedFanLimit) && storedFanLimit >= 45.0 && storedFanLimit <= 70.0) ? storedFanLimit : 70.0;
   batteryCalOffset = (isfinite(storedBatteryOffset) && storedBatteryOffset >= -8.00 && storedBatteryOffset <= 2.00) ? storedBatteryOffset : 0.0;
@@ -3474,17 +3705,24 @@ void loadSettingConfig() {
   fanMinSpeed = (storedFanMinSpeed <= 70) ? storedFanMinSpeed : 30;
   showPWM = storedPWM <= 1 ? storedPWM == 1 : true;
   displayMode = storedDisplayMode <= 2 ? storedDisplayMode : 2;
+  screenSaverStyle = storedScreenSaver <= 5 ? storedScreenSaver : 1;
+  rollingScreenSaverStyle = screenSaverStyle == 5 ? 1 : 0;
   fanStartTemp = (isfinite(storedFanStartTemp) && storedFanStartTemp >= 35 && storedFanStartTemp <= 75) ? storedFanStartTemp : 45.0;
   fanStopTemp = (isfinite(storedFanStopTemp) && storedFanStopTemp >= 25 && storedFanStopTemp < fanStartTemp) ? storedFanStopTemp : 40.0;
   fanMaxSpeed = (storedFanMaxSpeed >= max((uint8_t)20, fanMinSpeed) && storedFanMaxSpeed <= 100) ? storedFanMaxSpeed : 100;
   ledTempLimit = (isfinite(storedLedTempLimit) && storedLedTempLimit >= 65 && storedLedTempLimit <= 82) ? storedLedTempLimit : 75.0;
-  lowBatteryWarningVoltage = (isfinite(storedLowBattWarning) && storedLowBattWarning >= 10 && storedLowBattWarning <= 12) ? storedLowBattWarning : 11.0;
   lowBatteryOutputLimit = (storedLowBattLimit >= 1 && storedLowBattLimit <= 50) ? storedLowBattLimit : 15;
-  criticalBatteryVoltage = (isfinite(storedCriticalVoltage) && storedCriticalVoltage >= 8.5 && storedCriticalVoltage <= 9.6) ? storedCriticalVoltage : 9.0;
-  recoveryBatteryVoltage = (isfinite(storedRecoveryVoltage) && storedRecoveryVoltage > criticalBatteryVoltage && storedRecoveryVoltage <= 12.0) ? storedRecoveryVoltage : max(10.8f, criticalBatteryVoltage + 0.5f);
+  batteryChemistry = storedBatteryChemistry <= BATTERY_LITHIUM
+                       ? (BatteryChemistry)storedBatteryChemistry
+                       : BATTERY_POLYMER;
+  batterySeriesCount = storedBatterySeries >= 1 && storedBatterySeries <= 4
+                         ? storedBatterySeries
+                         : 3;
   pwmFrequencyKHz = (storedPWMFrequency >= PWM_FREQUENCY_MIN_KHZ && storedPWMFrequency <= PWM_FREQUENCY_MAX_KHZ) ? storedPWMFrequency : PWM_FREQUENCY_DEFAULT_KHZ;
   turboFanBoostEnabled = storedTurboFanMode <= 1 ? storedTurboFanMode == 1 : false;
   turboFanStartSpeed = storedTurboFanStart <= 100 ? storedTurboFanStart : 30;
+  invertLedPWM = storedInvertLedPWM <= 1 ? storedInvertLedPWM == 1 : false;
+  invertFanPWM = storedInvertFanPWM <= 1 ? storedInvertFanPWM == 1 : false;
   applyOLEDSettings();
 }
 
@@ -3498,12 +3736,11 @@ void outputLEDPWM(float percent) {
               100.0f
             );
 
-  // Konversi persentase ke PWM 10-bit.
-  // Tidak dibalik: semakin besar percent,
-  // semakin besar duty cycle HIGH pada pin D5.
   int pwm = (int)round(
               (percent / 100.0f) * PWM_MAX
             );
+
+  if (invertLedPWM) pwm = PWM_MAX - pwm;
 
   pwm = constrain(
           pwm,
@@ -3578,25 +3815,12 @@ void setFanPWM(int percent) {
     percent;
 
 
-  int pwm =
-    map(
-      percent,
-      0,
-      100,
-      0,
-      PWM_MAX
-    );
-
-
   if (
     percent !=
     lastFanPWMOutput
   ) {
 
-    analogWrite(
-      FAN_PWM_PIN,
-      pwm
-    );
+    writeFanPWMOutput(percent);
 
     lastFanPWMOutput =
       percent;
@@ -3699,6 +3923,134 @@ void updateSettingButton(uint8_t pin, bool &rawState, bool &stableState, unsigne
     if (stableState == LOW) pressed = true;
     else released = true;
   }
+}
+
+void drawScreenSaver() {
+  unsigned long now = millis();
+  uint8_t gazePhase = (now / 900UL) % 4;
+  int8_t gazeOffset = gazePhase == 1 ? -5 : gazePhase == 3 ? 5 : 0;
+  bool blink = now % 4200UL < 180UL;
+  uint8_t animationStyle = screenSaverStyle == 5
+                             ? rollingScreenSaverStyle
+                             : screenSaverStyle;
+
+  display.clearDisplay();
+
+  if (animationStyle == 1) {
+    const int16_t eyeY = 20;
+    if (blink) {
+      display.drawLine(22, eyeY + 12, 55, eyeY + 12, SSD1306_WHITE);
+      display.drawLine(73, eyeY + 12, 106, eyeY + 12, SSD1306_WHITE);
+    } else {
+      display.fillRoundRect(22, eyeY, 34, 25, 10, SSD1306_WHITE);
+      display.fillRoundRect(73, eyeY, 34, 25, 10, SSD1306_WHITE);
+      display.fillCircle(39 + gazeOffset, eyeY + 12, 5, SSD1306_BLACK);
+      display.fillCircle(90 + gazeOffset, eyeY + 12, 5, SSD1306_BLACK);
+      display.drawPixel(37 + gazeOffset, eyeY + 10, SSD1306_WHITE);
+      display.drawPixel(88 + gazeOffset, eyeY + 10, SSD1306_WHITE);
+    }
+  } else if (animationStyle == 2) {
+    uint16_t scanPosition = (now / 12UL) % 80;
+    int8_t scanOffset = scanPosition < 40
+                          ? (int8_t)(scanPosition / 4) - 5
+                          : 5 - (int8_t)((scanPosition - 40) / 4);
+    display.fillCircle(39, 32, 15, SSD1306_WHITE);
+    display.fillCircle(89, 32, 15, SSD1306_WHITE);
+    display.drawLine(24, 32, 104, 32, SSD1306_BLACK);
+    display.fillCircle(39 + scanOffset, 32, 6, SSD1306_BLACK);
+    display.fillCircle(89 + scanOffset, 32, 6, SSD1306_BLACK);
+    display.drawPixel(37 + scanOffset, 30, SSD1306_WHITE);
+    display.drawPixel(87 + scanOffset, 30, SSD1306_WHITE);
+  } else if (animationStyle == 3) {
+    bool asleep = now % 6000UL < 900UL;
+    if (asleep) {
+      display.drawLine(25, 34, 54, 34, SSD1306_WHITE);
+      display.drawLine(76, 34, 105, 34, SSD1306_WHITE);
+      display.drawLine(27, 35, 52, 35, SSD1306_WHITE);
+      display.drawLine(78, 35, 103, 35, SSD1306_WHITE);
+    } else {
+      display.fillRoundRect(24, 27, 32, 15, 7, SSD1306_WHITE);
+      display.fillRoundRect(74, 27, 32, 15, 7, SSD1306_WHITE);
+      display.fillRect(24, 27, 32, 7, SSD1306_BLACK);
+      display.fillRect(74, 27, 32, 7, SSD1306_BLACK);
+      display.fillCircle(39 + gazeOffset, 37, 4, SSD1306_BLACK);
+      display.fillCircle(89 + gazeOffset, 37, 4, SSD1306_BLACK);
+    }
+  } else if (animationStyle == 4) {
+    uint8_t lookPhase = (now / 950UL) % 8;
+    int8_t lookX = 0;
+    int8_t lookY = 0;
+    switch (lookPhase) {
+      case 1: lookX = -6; break;
+      case 3: lookX = 6; break;
+      case 5: lookY = -3; break;
+      case 7: lookY = 3; break;
+      default: break;
+    }
+
+    uint16_t blinkPhase = now % 5100UL;
+    bool eyesClosed = blinkPhase < 150UL ||
+                      (blinkPhase >= 260UL && blinkPhase < 360UL);
+    const int16_t leftX = 16;
+    const int16_t rightX = 72;
+    const int16_t eyeY = 19;
+
+    display.drawLine(leftX + 3, 14, leftX + 13, 11, SSD1306_WHITE);
+    display.drawLine(leftX + 13, 11, leftX + 27, 12, SSD1306_WHITE);
+    display.drawLine(rightX + 3, 12, rightX + 17, 11, SSD1306_WHITE);
+    display.drawLine(rightX + 17, 11, rightX + 29, 14, SSD1306_WHITE);
+
+    if (eyesClosed) {
+      display.drawLine(leftX + 2, eyeY + 14, leftX + 10, eyeY + 11, SSD1306_WHITE);
+      display.drawLine(leftX + 10, eyeY + 11, leftX + 20, eyeY + 11, SSD1306_WHITE);
+      display.drawLine(leftX + 20, eyeY + 11, leftX + 28, eyeY + 14, SSD1306_WHITE);
+      display.drawLine(rightX + 2, eyeY + 14, rightX + 10, eyeY + 11, SSD1306_WHITE);
+      display.drawLine(rightX + 10, eyeY + 11, rightX + 20, eyeY + 11, SSD1306_WHITE);
+      display.drawLine(rightX + 20, eyeY + 11, rightX + 28, eyeY + 14, SSD1306_WHITE);
+    } else {
+      display.fillRoundRect(leftX, eyeY, 32, 29, 14, SSD1306_WHITE);
+      display.fillRoundRect(rightX, eyeY, 32, 29, 14, SSD1306_WHITE);
+      display.drawRoundRect(leftX, eyeY, 32, 29, 14, SSD1306_WHITE);
+      display.drawRoundRect(rightX, eyeY, 32, 29, 14, SSD1306_WHITE);
+
+      int16_t leftPupilX = leftX + 16 + lookX;
+      int16_t rightPupilX = rightX + 16 + lookX;
+      int16_t pupilY = eyeY + 14 + lookY;
+      display.fillCircle(leftPupilX, pupilY, 7, SSD1306_BLACK);
+      display.fillCircle(rightPupilX, pupilY, 7, SSD1306_BLACK);
+      display.drawCircle(leftPupilX, pupilY, 8, SSD1306_BLACK);
+      display.drawCircle(rightPupilX, pupilY, 8, SSD1306_BLACK);
+      display.fillCircle(leftPupilX, pupilY, 3, SSD1306_WHITE);
+      display.fillCircle(rightPupilX, pupilY, 3, SSD1306_WHITE);
+      display.drawPixel(leftPupilX - 2, pupilY - 3, SSD1306_WHITE);
+      display.drawPixel(rightPupilX - 2, pupilY - 3, SSD1306_WHITE);
+    }
+  }
+}
+
+void drawLowBatteryAlert() {
+  display.clearDisplay();
+
+  if (batteryBlinkState) {
+    drawBatteryIcon(54, 8, batteryPresent ? batteryPercent : 0);
+  }
+
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  int16_t x1, y1;
+  uint16_t textWidth, textHeight;
+  display.getTextBounds("LOW BATT", 0, 0, &x1, &y1, &textWidth, &textHeight);
+  display.setCursor((SCREEN_WIDTH - textWidth) / 2, 29);
+  display.print("LOW BATT");
+
+  display.setTextSize(1);
+  display.setCursor(52, 54);
+  if (batteryPresent) {
+    display.print(batteryVoltage, 1);
+  } else {
+    display.print("0.0");
+  }
+  display.print("V");
 }
 
 void updateSmoothLED() {
@@ -3850,26 +4202,46 @@ void setup() {
 void loop() {
   unsigned long now =
     millis();
-  requestNanoBattery();
-  bacaDataBatteryNano();
-  updateNanoConnection();
-  bacaBattery();
-  updateNanoWarningDisplay();
-  if (!nanoConnected) {
-    forceNanoDisconnectedOutputsOff();
-    return;
+  if (!nanoPaused) {
+    bacaDataBatteryNano();
+    updateNanoConnection();
+    requestNanoBattery();
+    bacaBattery();
+    checkBatteryProtection();
+    updateNanoWarningDisplay();
+    updateBatteryWarningBlink();
+    updateWarningBlink();
+
+    if (nanoWakePending && now - nanoWakeStartedAt >= NANO_WAKE_TIMEOUT) {
+      nanoWakePending = false;
+      freshBatteryRequired = false;
+      pendingMainClicks = 0;
+      mainScreenRequested = false;
+    }
+
+    if (!freshBatteryRequired && pendingMainClicks > 0) {
+      mainClickCount = pendingMainClicks;
+      pendingMainClicks = 0;
+      executeMainClicks();
+    }
   }
-  checkBatteryProtection();
-  updateBatteryWarningBlink();
-  updateWarningBlink();
   // Jika menu sedang aktif, jangan jalankan handler tombol normal.
   // Handler normal dapat menafsirkan MAIN sebagai klik mode.
   if (settingMode) {
     handleSettingMenu();
+    if (now - lastDisplay >= SETTING_DISPLAY_INTERVAL) {
+      lastDisplay = now;
+      tampilkanOLED();
+    }
+    return;
+  }
+  if (!nanoConnected && !nanoPaused && !nanoWakePending) {
+    forceNanoDisconnectedOutputsOff();
     if (now - lastDisplay >= DISPLAY_INTERVAL) {
       lastDisplay = now;
       tampilkanOLED();
     }
+    updateNanoPauseState();
     return;
   }
   handleLockButtons();
@@ -3877,10 +4249,19 @@ void loop() {
   updateTurboTimeout();
   if (settingMode) {
     handleSettingMenu();
+    if (now - lastDisplay >= SETTING_DISPLAY_INTERVAL) {
+      lastDisplay = now;
+      tampilkanOLED();
+    }
+    return;
+  }
+  if (!nanoConnected) {
+    forceNanoDisconnectedOutputsOff();
     if (now - lastDisplay >= DISPLAY_INTERVAL) {
       lastDisplay = now;
       tampilkanOLED();
     }
+    updateNanoPauseState();
     return;
   }
   handlePlusButton();
@@ -3924,4 +4305,5 @@ void loop() {
       now;
     tampilkanOLED();
   }
+  updateNanoPauseState();
 }
